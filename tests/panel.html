@@ -1,0 +1,26 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>panel</title>
+<!-- The loader's panel on a page with no game: opened by tests/panel.mjs in headless Chrome. -->
+<script>localStorage.clear(); localStorage.setItem('u2ml:panel:open', '["drone","topdown"]');</script>
+<script src="../lib/wasmpatch.js"></script>
+<script src="../loader.js"></script>
+<script src="../mods/topdown.js"></script>
+<script src="../mods/drone.js"></script>
+<script src="../mods/camfinder.js"></script>
+<script src="../mods/template.js"></script>
+</head><body style="background:#333;margin:0;height:1400px">
+<script>
+  window.onerror = m => { document.title = 'ERR ' + m; };
+  // the loader builds the panel on an animation frame: wait for its sliders, then set a value as the console would
+  // (on frames too: headless Chrome's virtual time runs frames later than timers)
+  let frames = 0;
+  const check = () => {
+    const sliders = document.querySelectorAll('input[type=range]').length;
+    if (!sliders && ++frames < 120) { requestAnimationFrame(check); return; }
+    U2ML.options('drone', 'dist', 20);
+    const shown = [...document.querySelectorAll('span')].some(s => s.textContent === '20.0 m');
+    if (!document.title.startsWith('ERR')) document.title = shown && sliders > 10 ? `OK ${sliders} sliders` : `WRONG sliders ${sliders}, value shown ${shown}`;
+  };
+  requestAnimationFrame(check);
+</script>
+</body></html>
