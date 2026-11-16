@@ -1,7 +1,8 @@
 # Roadmap
 
-What could turn the loader into a fuller mod platform, in the order planned. Phase 1 is built (0.3.0) and waiting
-for its live check; nothing after it is built yet.
+What could turn the loader into a fuller mod platform, in the order planned. Phases 1 (0.3.0) and 2 (0.4.0) are built
+and proven on the live site; nothing after them is built yet. To-dos for the mods themselves (not the loader)
+are in [mods/TODO.md](mods/TODO.md).
 Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 
 ## The limit everything works around
@@ -9,7 +10,7 @@ Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 Hook code can't call into JavaScript. The game's workers build the module's import list, and an extension can't
 run code inside workers. So every hook is a few wasm instructions that talk to the page through shared memory.
 
-## 1. A general hook system (first; the rest depends on it): built in 0.3.0, not yet checked live
+## 1. A general hook system (first; the rest depends on it): built in 0.3.0, proven live
 
 As built: [MODDING.md](MODDING.md#hooks-running-at-the-games-own-moments) for mods, [CLAUDE.md](CLAUDE.md) for how.
 The LREGS check came out fine (registers are current at entry). The slots moved to `0xFF0000`: `0xD0F000` is
@@ -36,7 +37,12 @@ function, one after another.
 **Check first:** nfsu2-web's LREGS builds keep CPU registers in wasm locals. Confirm the CPU struct is up to date
 at a function's entry, or capture hooks would read stale registers.
 
-## 2. Running mods on the game's frame
+## 2. Running mods on the game's frame: built in 0.4.0, proven live
+
+Mods with `runOn: 'game'` run once a game frame. Live: they ran before the frame's views in 93% of frames (the
+rest after part or all of the frame), and the drone felt steadier, so both cameras run on the game's frames now.
+Left for later: the late 7%. A camera that must never be a frame behind would have to be computed in the hook
+itself (from the car's position at the view setup), not on the page. What was planned:
 
 A notify hook on GameLoop's once-a-frame call (`0x4022C0` with `ret: 0x581475`; GameLoop `0x5811C0` itself is
 entered once and never returns, found in the first live test) lets the loader run `frame` after each game frame,

@@ -9,10 +9,11 @@ const W = globalThis.U2WasmPatch, { prologue: P, ON } = W;
 let ok = true; const check = (what, c) => { console.log(c ? 'ok  ' : 'FAIL', what); ok &&= !!c; };
 
 // slots by hand (the loader allocates them in the real thing)
+const ORDER = 0xff0700;                                     // the order counter all hooks share
 const S = { notify: 0xff0000, capture: 0xff0010, write: 0xff0200, raceSeen: 0xff0300, skip: 0xff0310, loop: 0xff0320 };
 const hooks = [
-  { guestAddr: FN.view, build: P.notify({ slot: S.notify }) },
-  { guestAddr: FN.view, build: P.capture({ slot: S.capture, keep: 4, args: 2 }) },
+  { guestAddr: FN.view, build: P.notify({ slot: S.notify, orderAt: ORDER }) },
+  { guestAddr: FN.view, build: P.capture({ slot: S.capture, keep: 4, args: 2, orderAt: ORDER }) },
   { guestAddr: FN.loop, build: P.write({ slot: S.write, to: { reg: 'ecx' }, ranges: [[0x10, 8], [0x40, 4]] }) },
   { guestAddr: FN.loop, build: P.notify({ slot: S.loop }) },
   { guestAddr: FN.view + 1, build: P.notify({ slot: 0xff0400 }) },                 // not a function's start
@@ -43,11 +44,13 @@ check('a flag of 1 (not ON) is still off', u32(S.notify + 4) === 0);
 set(S.notify, ON); set(S.capture, ON);
 for (let i = 0; i < 6; i++) { set(CPU + R.eax, 0x100 + i); set(CPU + R.ecx, 0xc0ffee); X.fView(CPU); }
 check('notify counts each call, and the body still runs', u32(S.notify + 4) === 6 && u32(COUNTER.view) === 8);
-const entry = n => { const e = S.capture + 16 + (n & 3) * W.captureEntry(2); return { seq: u32(e), eax: u32(e + 4), ecx: u32(e + 8), esp: u32(e + 20), ret: u32(e + 40), a: [u32(e + 44), u32(e + 48)] }; };
+const entry = n => { const e = S.capture + 16 + (n & 3) * W.captureEntry(2); return { seq: u32(e), order: u32(e + 4), eax: u32(e + 8), ecx: u32(e + 12), esp: u32(e + 24), ret: u32(e + 44), a: [u32(e + 48), u32(e + 52)] }; };
 const last = entry(5);
 check('capture: the registers, the return address and the arguments', last.seq === 12 && last.eax === 0x105 && last.ecx === 0xc0ffee &&
   last.esp === STACK && last.ret === 0x5a1234 && last.a[0] === 0xaaa && last.a[1] === 0xbbb);
 check('capture: a ring of 4 keeps calls 2-5, each with its seq', [2, 3, 4, 5].every(n => entry(n).seq === 2 * n + 2 && entry(n).eax === 0x100 + n));
+check('order: notify then capture on each call, one counter for both', u32(ORDER) === 12 && u32(S.notify + 12) === 10 && u32(S.capture + 12) === 11 &&
+  last.order === 11 && [2, 3, 4, 5].every(n => entry(n).order === 2 * n + 1));
 
 // write: the current buffer's ranges into [ecx + off]
 const T = 0x1003000, B0 = S.write + 16, size = W.writeLayout([[0x10, 8], [0x40, 4]]).size;

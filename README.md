@@ -48,7 +48,8 @@ After that, the camera mods work.
 | Line | Good | If not |
 |---|---|---|
 | `memory` | a size, e.g. `2048 MB` | `not caught`: see [Problems](#problems) |
-| `hooks` | `4 in` (a number) | `failed: …` or `not in: …`: the camera mods still work but may flicker. See [Problems](#problems) |
+| `frames` | `screen 120/s  game 117/s` | `game no hook` or `game waiting`: mods meant for the game's frames run on the screen's |
+| `hooks` | `5 in` (a number) | `failed: …` or `not in: …`: the camera mods still work but may flicker. See [Problems](#problems) |
 | `flow` | `6` and `driving yes` while you drive | `driving no` in menus, photo mode and replays is normal |
 | `camera` | `layout known` | `learning`: drive with the normal camera for a moment |
 | `car fwd` | three numbers | `learning`: drive straight, 20 km/h or more |

@@ -24,6 +24,7 @@
     id: 'drone',
     name: 'Drone camera',
     group: 'camera',
+    runOn: 'game',           // once a game frame: steadier than the screen's frames (live, 0.4.0)
     defaultOn: false,
     options: [
       { key: 'dist', label: 'Distance behind', type: 'number', min: 2, max: 80, step: 0.5, default: 11, unit: 'm' },

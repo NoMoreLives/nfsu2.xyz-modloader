@@ -57,7 +57,8 @@ U2ML.register({
   init(api, store) {},                  // once, as the mod loads
   enable(api, store) {},                // each time it's switched on
   disable(api, store) {},               // each time it's switched off
-  frame(api, dt, store) {},             // every frame while it's on
+  runOn: 'screen',             // 'game': frame runs once per game frame instead (see The life cycle)
+  frame(api, dt, store, info) {},       // every frame while it's on (info.on: 'screen' or 'game')
   onOption(key, value, api, store) {},  // an option changed
   status(api, store) { return '...' },  // a line in the panel while it's on
 });
@@ -80,6 +81,15 @@ keeps it private (the template and the drone do this). Hotkey functions don't ge
 
 `dt` is the time since the last frame in seconds, at most 0.1. Use it for anything that moves, so the mod behaves
 the same at any frame rate.
+
+**The screen's frames or the game's.** The game makes its frames on its own thread at its own rate (often not the
+screen's: 117 a second on a 120 Hz screen in one test). With `runOn: 'game'`, `frame` runs once per game frame
+instead: the loader's hook on the game's per-frame call (`0x4022C0`, called by GameLoop from `0x581470`) wakes the
+page, and the mods run as soon as the page hears of it. The game doesn't wait for them. `dt` is then the real time
+between game frames, and `info` is `{ on: 'game', frame, order }` (the game frame's number, and its place on the
+hooks' order). While the game's frames don't come (the hook isn't in, or nothing calls it for 250 ms) the mod runs
+on the screen's frames, with `info.on` `'screen'`. In the console, `U2ML.runOn('drone', 'game')` moves a mod
+(saved), `U2ML.runOn('drone')` says where it runs.
 
 **If `frame` throws an error, the loader switches the mod off** and logs the error. The player can switch it on
 again. `init`, `enable`, `disable`, `onOption` and hotkeys that throw are logged but don't switch it off.
@@ -335,9 +345,10 @@ still see a skipped call.
 | `state` | `in`, `waiting for the game module`, `failed: …`, `too late: reload the page`, `area busy` |
 | `ready` | `true` when it's in and can be used |
 | `count()` | Calls counted so far (only while the hook was on) |
+| `order()` | Where its last call came on the order all hooks share: of two calls, the later has the higher number. Compare with `api.after(a, b)` (true when a came after b; it allows for the counter wrapping round). |
 | `wait(ms)` | A promise that resolves at the next call (or after `ms`) with the count. Needs `wake`. |
 | `enable(false)` | Switch the hook off while the mod stays on; `enable()` back on |
-| `read()` | capture: the last call, `{ call, eax, ecx, edx, ebx, esp, ebp, esi, edi, eip, ret, args }`, or `null` |
+| `read()` | capture: the last call, `{ call, order, eax, ecx, edx, ebx, esp, ebp, esi, edi, eip, ret, args }`, or `null` |
 | `since(n)` | capture: the calls numbered `n` and later that the ring still holds, oldest first (numbers start at 0) |
 | `setF32(off, x)`, `setF32s`, `setVec3`, `setU32`, `setBytes` | write: fill in values, by offset from the target |
 | `commit()` | write: the values go to the game from its next call on, and stay until `off()` |
@@ -376,6 +387,8 @@ The global `U2ML` is there for experiments in Chrome's console.
 |---|---|
 | `U2ML.status()` | Memory caught? Hooks in? Driving? Layout known? |
 | `U2ML.hooks()` | Every hook: its mod, address, kind, state, calls (as a table) |
+| `U2ML.frames()` | The screen's frame rate and the game's |
+| `U2ML.runOn('drone', 'game')` | Run a mod on the game's frames (`'screen'`: back); saved |
 | `U2ML.mods` | The loaded mods (a `Map` by id); `U2ML.mods.get('drone').def` is the drone's definition |
 | `U2ML.setEnabled('drone', true)` | Switch a mod on or off |
 | `U2ML.options('drone')` | A mod's option values |

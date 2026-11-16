@@ -12,7 +12,7 @@
   'use strict';
   if (window.U2ML) return;
 
-  const VERSION = '0.3.0';
+  const VERSION = '0.4.0';
   const log = (...a) => console.log('[u2ml]', ...a);
   const warn = (...a) => console.warn('[u2ml]', ...a);
   const MIN_GAME_PAGES = 4096;        // 256 MB: the game's memory is about 1 GB from its first menus (memory.ts)
@@ -62,7 +62,8 @@
     // player 2 ride is at 0xD0F000, where 0.2.0's camera mailbox was.
     AREA: 0x00ff0000, END: 0x01000000,
     ANCHOR: 0x005c7ec0,              // the view setup, proven a lifted function: the game's tables are found by it
-    list: [], next: 0x00ff0000, compiled: false, busy: null, nextScan: 0,
+    // +0 the order counter every hook stamps (lib/wasmpatch.js stamp), +4..+15 zero; the slots follow
+    list: [], next: 0x00ff0010, compiled: false, busy: null, nextScan: 0,
   };
   const KINDS = ['notify', 'capture', 'write', 'skip'];
   const REGS = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi', 'eip'];
@@ -116,7 +117,7 @@
       for (const h of todo) if (!h.slot) {              // given once: a second compile puts the same slots in
         const size = (P.slotSize(h) + 15) & ~15;
         if (HOOKS.next + size > HOOKS.END) { h.state = 'failed: the hook area is full'; warn(`hook ${h.id}: the hook area is full`); continue; }
-        h.slot = HOOKS.next; HOOKS.next += size;
+        h.slot = HOOKS.next; HOOKS.next += size; h.orderAt = HOOKS.AREA;
       }
       // on one function, the skips go last: the other hooks there still see the call
       const go = todo.filter(h => h.slot).sort((x, y) => (x.kind === 'skip') - (y.kind === 'skip'));
@@ -256,8 +257,8 @@
     for (const h of live) {
       if (aget(h.slot) !== h.written) return areaBusy(h.slot);
       if (aget(h.slot + 8) !== h.w8) return areaBusy(h.slot + 8);
-      if (aget(h.slot + 12)) return areaBusy(h.slot + 12);
     }
+    for (let a = HOOKS.AREA + 4; a < HOOKS.AREA + 16; a += 4) if (aget(a)) return areaBusy(a);
     if (t >= HOOKS.nextScan) {
       HOOKS.nextScan = t + 250;
       for (let a = HOOKS.next; a < HOOKS.END; a += 4) if (mem.u32(a)) return areaBusy(a);
@@ -279,16 +280,20 @@
       get ready() { return hookReady(h); },
       /** the calls counted while it was on */
       count: () => hookReady(h) ? aget(h.slot + 4) : 0,
+      /** when its last call came, on the order all hooks share: a later call of any hook has a higher number
+       *  (compare with U2ML.after(a, b), which allows for the counter wrapping round) */
+      order: () => hookReady(h) ? aget(h.slot + 12) : 0,
       /** switch it off (or back on) while its mod stays on */
       enable(on = true) { h.user = !!on; syncHook(h); },
       /** resolves with the count at the next call, or after ms. Only a notify hook (or one declared with
-       *  wake: true) wakes the page; otherwise this just waits ms. */
-      wait(ms = 1000) {
+       *  wake: true) wakes the page; otherwise this just waits ms. since: resolve at once if the count is no
+       *  longer that (a call came while the page was busy) */
+      wait(ms = 1000, since) {
         const v = ints();
         if (!hookReady(h) || !h.wakes || !(v.buffer instanceof SharedArrayBuffer) || !Atomics.waitAsync) {
           return new Promise(r => setTimeout(() => r(H.count()), h.wakes ? Math.min(ms, 100) : ms));
         }
-        const i = (h.slot + 4) >> 2, w = Atomics.waitAsync(v, i, Atomics.load(v, i), ms);
+        const i = (h.slot + 4) >> 2, w = Atomics.waitAsync(v, i, since ?? Atomics.load(v, i), ms);
         return (w.async ? w.value : Promise.resolve(w.value)).then(() => H.count());
       },
     };
@@ -298,14 +303,14 @@
       const entry = n => {
         const e = h.slot + 16 + (n & (h.keep - 1)) * size(), want = (2 * n + 2) >>> 0;
         if (aget(e) !== want) return null;
-        const x = { call: n };
-        REGS.forEach((r, i) => { x[r] = mem.u32(e + 4 + 4 * i); });
-        x.ret = mem.u32(e + 40);
-        x.args = Array.from({ length: h.args }, (_, i) => mem.u32(e + 44 + 4 * i));
+        const x = { call: n, order: mem.u32(e + 4) };
+        REGS.forEach((r, i) => { x[r] = mem.u32(e + 8 + 4 * i); });
+        x.ret = mem.u32(e + 44);
+        x.args = Array.from({ length: h.args }, (_, i) => mem.u32(e + 48 + 4 * i));
         return aget(e) === want ? x : null;
       };
       Object.assign(H, {
-        /** the last call: { call, eax ... edi, eip, ret, args }, or null (eip is not kept up to date by the game) */
+        /** the last call: { call, order, eax ... edi, eip, ret, args }, or null (eip is not kept up to date by the game) */
         read() {
           for (let k = 0; k < 4; k++) { const c = H.count(); if (!c) return null; const x = entry(c - 1); if (x) return x; }
           return null;
@@ -492,7 +497,7 @@
     blurWas: null,                 // the player's Motion Blur option while a mod's camera turned it off
   };
   function calibrateTick() {
-    if (cam.layout || !game.driving() || cam.writtenThisFrame) return;
+    if (cam.layout || !game.driving() || cam.writer || cam.writtenThisFrame) return;
     const g = cam.gameCamera();
     if (!g || v3.len(v3.sub(g.target, g.eye)) < 0.1) return;
     const r = calibrateSample(g.matrix, g.eye, g.target);
@@ -558,7 +563,9 @@
 
   // ---- mods ------------------------------------------------------------------------------------------------
   const mods = new Map();
-  const api = { VERSION, mem, game, v3, camera: cam, log, warn };
+  const api = { VERSION, mem, game, v3, camera: cam, log, warn,
+    /** a is later than b on the hooks' shared order (allows for the counter wrapping round) */
+    after: (a, b) => ((a - b) | 0) > 0 };
   // ---- mod options -----------------------------------------------------------------------------------------
   // A mod lists them in def.options:
   //   { key, label, type: 'number', min, max, step, default, unit }      a slider
@@ -614,6 +621,7 @@
       if (h.name && !m.hooks[h.name]) m.hooks[h.name] = h.handle;
       else if (h.name) warn(`${def.id}: two hooks are named ${h.name}`);
     }
+    m.runOn = runOnOf(m);
     mods.set(def.id, m);
     try { def.init?.(api, m.store); } catch (e) { warn(`${def.id} init`, e); }
     setEnabled(def.id, load(`u2ml:on:${def.id}`, !!def.defaultOn), false);
@@ -633,33 +641,66 @@
     panel.rebuild();
   }
 
-  // ---- the frame -------------------------------------------------------------------------------------------
-  let last = performance.now();
+  // ---- the frames: the screen's and the game's ---------------------------------------------------------------
+  // The page's animation frames come at the screen's rate; the game makes its frames on its own thread at its own
+  // rate. GameLoop (0x5811C0) calls the empty 0x4022C0 once a frame, returning to 0x581475 (nfsu2-web
+  // runtime/career.c), and the loader's frame hook there wakes the page. A mod runs on the screen's frames unless
+  // it asks for the game's (def.runOn: 'game', or U2ML.runOn(id, 'game')): then once a game frame, as soon as the
+  // page hears of it, while the hook works; on the screen's frames when it doesn't.
+  const frameHook = declareHook(null, { name: 'frame', kind: 'notify', at: 0x004022c0, ret: 0x00581475 }).handle;
+  const GF = { count: 0, t: 0, lastWake: -1e9, frames: 0, runs: 0, missed: 0, rate: null, from: 0 };
+  const SF = { last: performance.now(), frames: 0, rate: null, from: 0 };
+  const gameLive = () => frameHook.ready && performance.now() - GF.lastWake < 250;
+  const runOnOf = m => load(`u2ml:runon:${m.def.id}`, m.def.runOn === 'game' ? 'game' : 'screen');
+  /** where a mod's frame runs now: 'game' or 'screen' */
+  const loopOf = m => m.runOn === 'game' && gameLive() ? 'game' : 'screen';
+  function runMods(loop, dt, info) {
+    cam.writtenThisFrame = false;
+    for (const m of mods.values()) {
+      if (!m.on || !m.def.frame || loopOf(m) !== loop) continue;
+      try { m.def.frame(api, dt, m.store, info); }
+      catch (e) { warn(`${m.def.id} frame failed, turned off`, e); setEnabled(m.def.id, false, false); }
+    }
+    // the camera: a loop's mods wrote it, or the game's own comes back. A loop leaves it to the other loop's
+    // mods while they write it (and while the game's frames still come, for the game loop's).
+    if (cam.writtenThisFrame) { cam.writer = loop; if (cam.pump && !cam.viaHook) pumpCh.port2.postMessage(0); return; }
+    if (cam.writer && cam.writer !== loop && !(cam.writer === 'game' && !gameLive())) return;
+    cam.writer = null;
+    cam.wrote = null;
+    if (cam.viaHook) { camHook.off(); cam.viaHook = false; cam.lastEye = null; }      // the game's camera back
+    if (cam.blurWas != null) {                                                 // and the player's motion blur
+      if (mem.u32(ADDR.MOTION_BLUR) === 0) mem.setU32(ADDR.MOTION_BLUR, cam.blurWas);
+      cam.blurWas = null;
+    }
+  }
   function tick(t) {
-    const dt = Math.min(0.1, Math.max(0, (t - last) / 1000)); last = t;
+    const dt = Math.min(0.1, Math.max(0, (t - SF.last) / 1000)); SF.last = t; SF.frames++;
+    if (t - SF.from >= 1000) { SF.rate = SF.frames * 1000 / (t - SF.from); SF.frames = 0; SF.from = t; }
     if (memory) {
       try { hooksTick(t); } catch (e) { warn('hooks', e); }
-      cam.writtenThisFrame = false;
       try { calibrateTick(); } catch (e) { warn('calibration', e); }
-      for (const m of mods.values()) {
-        if (!m.on || !m.def.frame) continue;
-        try { m.def.frame(api, dt, m.store); }
-        catch (e) { warn(`${m.def.id} frame failed, turned off`, e); setEnabled(m.def.id, false, false); }
-      }
+      runMods('screen', dt, { on: 'screen' });
       try { axesTick(); } catch (e) { warn('car axes', e); }
-      if (!cam.writtenThisFrame) {
-        cam.wrote = null;
-        if (cam.viaHook) { camHook.off(); cam.viaHook = false; cam.lastEye = null; }      // the game's camera back
-        if (cam.blurWas != null) {                                                 // and the player's motion blur
-          if (mem.u32(ADDR.MOTION_BLUR) === 0) mem.setU32(ADDR.MOTION_BLUR, cam.blurWas);
-          cam.blurWas = null;
-        }
-      } else if (cam.pump && !cam.viaHook) pumpCh.port2.postMessage(0);
     }
     panel.update(t);
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
+  // the game's frames: the frame hook's count, waited on (a frame that came while the page was busy wakes it at once)
+  async function gameLoop() {
+    for (;;) {
+      const c = await frameHook.wait(250, GF.count);
+      if (!frameHook.ready || c === GF.count) continue;
+      const now = performance.now(), n = (c - GF.count) >>> 0;
+      const first = !GF.t || now - GF.t > 250;
+      if (!first) { GF.frames += n; GF.runs++; if (n > 1) GF.missed += n - 1; }
+      const dt = first ? 0 : Math.min(0.1, (now - GF.t) / 1000);
+      GF.count = c; GF.t = now; GF.lastWake = now;
+      if (now - GF.from >= 1000) { GF.rate = { frames: GF.frames * 1000 / (now - GF.from), runs: GF.runs * 1000 / (now - GF.from), missed: GF.missed }; GF.frames = GF.runs = GF.missed = 0; GF.from = now; }
+      try { runMods('game', dt, { on: 'game', frame: c, order: frameHook.order() }); } catch (e) { warn('game frame', e); }
+    }
+  }
+  gameLoop();
 
   // ---- hotkeys ---------------------------------------------------------------------------------------------
   const combo = e => (e.ctrlKey ? 'Ctrl+' : '') + (e.altKey ? 'Alt+' : '') + (e.shiftKey ? 'Shift+' : '') + e.code;
@@ -693,6 +734,13 @@
     if (!HOOKS.compiled) return PATCH.state;
     const bad = HOOKS.list.filter(h => h.state !== 'in');
     return `${HOOKS.list.length - bad.length} in` + (bad.length ? `; not in: ${bad.map(h => `${h.id} (${h.state})`).join(', ')}` : '');
+  }
+  /** the panel's frames line: the screen's rate, the game's, and the mods on the game's */
+  function framesLine() {
+    const r = n => n == null ? '-' : n.toFixed(0);
+    const onGame = [...mods.values()].filter(m => m.on && m.def.frame && m.runOn === 'game').map(m => m.def.id);
+    const g = GF.rate && gameLive() ? `game ${r(GF.rate.frames)}/s${GF.rate.missed ? ` (${GF.rate.missed} missed)` : ''}` : `game ${frameHook.ready ? 'waiting' : 'no hook'}`;
+    return `screen ${r(SF.rate)}/s  ${g}${onGame.length ? `  on it: ${onGame.join(' ')}${gameLive() ? '' : ' (on the screen\'s for now)'}` : ''}`;
   }
   /** every hook, for the console: U2ML.hooks() */
   function hooksTable() {
@@ -817,6 +865,7 @@
       lines.push(`memory  ${memory ? Math.round(memory.buffer.byteLength / 1048576) + ' MB' : 'not caught (reload with the extension on)'}`);
       lines.push(`module  ${module ? `names ${hasNames ? 'kept' : 'stripped'}` : '-'}`);
       lines.push(`hooks   ${hooksLine()}`);
+      lines.push(`frames  ${framesLine()}`);
       if (memory) {
         const p = game.carPos(), c = game.camera();
         lines.push(`flow ${game.flow()}  race ${game.raceState()}  mover ${game.moverType()}  driving ${game.driving() ? 'yes' : 'no'}`);
@@ -870,7 +919,17 @@
     VERSION, register, setEnabled, mods, mem, game, v3, camera: cam, scan,
     /** a mod's option values, or set one: U2ML.options('drone'), U2ML.options('drone', 'dist', 15) */
     options: (id, key, value) => { const m = mods.get(id); if (!m) return null; if (key !== undefined) return m.store.set(key, value); return m.store.all(); },
-    status: () => ({ memory: !!memory, module: !!module, hasNames, hooks: hooksLine(), flow: game.flow(), driving: game.driving(), layout: cam.layout }),
+    status: () => ({ memory: !!memory, module: !!module, hasNames, hooks: hooksLine(), frames: framesLine(), flow: game.flow(), driving: game.driving(), layout: cam.layout }),
+    /** where a mod's frame runs: U2ML.runOn('drone') -> 'game' | 'screen'; U2ML.runOn('drone', 'game') sets it */
+    runOn: (id, where) => {
+      const m = mods.get(id); if (!m) return null;
+      if (where !== undefined) { m.runOn = where === 'game' ? 'game' : 'screen'; save(`u2ml:runon:${id}`, m.runOn); log(`${id} runs on the ${m.runOn}'s frames`); }
+      return m.runOn;
+    },
+    /** a is later than b on the hooks' shared order (allows for the counter wrapping round) */
+    after: (a, b) => ((a - b) | 0) > 0,
+    /** the frame rates: { screen, game: { frames, runs, missed } } per second */
+    frames: () => ({ screen: SF.rate, game: gameLive() ? GF.rate : null }),
     /** every hook: its mod, address, kind, state and calls */
     hooks: () => { const t = hooksTable(); try { console.table(t); } catch { /* no table */ } return t; },
     _test: { buildMatrix, calibrateSample },

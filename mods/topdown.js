@@ -7,6 +7,7 @@ U2ML.register({
   id: 'topdown',
   name: 'Top-down camera',
   group: 'camera',
+  runOn: 'game',             // once a game frame (live, 0.4.0)
   defaultOn: false,
   options: [
     { key: 'height', label: 'Height', type: 'number', min: 5, max: 400, step: 1, default: 40, unit: 'm' },

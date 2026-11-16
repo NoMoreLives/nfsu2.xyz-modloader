@@ -62,15 +62,22 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   at ~115 game frames/s, views 0, 1, 4, 9 (headlights) and 16–21 (cube map faces) each once a frame, no 3 (the
   mirror) with top-down on. The captured `[esp+4]` is exactly eView `0x832DE0 + id·0x70` (view 21 at
   `0x833710`), ecx `0x874B20`, every return address in the game's code. Notify at GameLoop `0x5811C0` counted 0:
-  GameLoop is the loop itself, entered once (see below).
+  GameLoop is the loop itself, entered once and never returning; it calls the empty `0x4022C0` (~300 callers)
+  once a frame, returning to `0x581475` (nfsu2-web `runtime/career.c`).
+- **Game-frame mods (0.4.0):** `frames screen 120/s game 120/s`, `hooks 5 in`. A frame makes its views in the
+  order 0, 1, 4, 9, 16–21 (view 0 comes before the main view 1). The probe ran before any of the frame's views
+  in 93% of 121 frames; late: 1 after 4 views, 8 after all 10 (the page ran after the whole frame). On a late
+  frame a camera mod's camera from the frame before still shows (the write hook keeps its buffer). The drone on
+  the game's frames felt slightly less jittery than on the screen's (user), so the cameras now default to
+  `runOn: 'game'`. Some jitter is left: see `mods/TODO.md`. Top-down on the game's frames: looks great (user).
+- **Hook system, second test:** notify at `0x4022C0` with `ret: 0x581475` counts 117/s = the game's frame rate,
+  and `Atomics.waitAsync` woke the page 117/s: the page can follow the game's frames. The drone camera through
+  the `u2ml.camera` write hook at `0xFF0000` is flicker-free (user confirmed). Not exercised live yet: write hooks
+  from a mod, skip, `{ reg }` targets, the guard tripping.
 
 ## Not yet proven live
 
-- **Hooks, the per-frame call and the page's wake:** the probe's `loop` hook moved from `0x5811C0` to `0x4022C0`
-  with `ret: 0x581475` after the first live test read `loop 0/s` (GameLoop never returns: it is the loop, and
-  calls the empty `0x4022C0`, ~300 callers, once a frame; nfsu2-web `runtime/career.c`). Not yet checked live.
-- Whether the camera through the new `u2ml.camera` write hook (slot `0xFF0000`) is still flicker-free: top-down
-  was on in the first 0.3.0 test and the eye sat above the car, but flicker wasn't reported either way.
+
 - Whether small functions are inlined into their callers in the site's build (then a hook there misses those
   calls). The 0.2.0 camera hook at `0x5C7EC0` did catch the main view's call.
 - The options panel (0.2.0) and the template mod: tested offline only (`tests/options`, `tests/template`, `--panel`).
@@ -126,6 +133,15 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   target and matching the game's matrix; 30 matching samples in a row.
 - **Drone smoothing** is relative to the car, a critically damped spring on the offset. Smoothing the absolute
   position lagged 2v/ω behind: 23 m at 72 km/h in the first version.
+- **The frames** (`loader.js` "the frames"): two loops call `runMods`: the screen's (`requestAnimationFrame`, also
+  hooks guard, calibration, car axes, panel) and the game's (`gameLoop`, waits on `u2ml.frame`'s count with the
+  last count seen, so a frame that came while the page was busy wakes it at once). `loopOf` sends a
+  `runOn: 'game'` mod to the game's loop while its frames came in the last 250 ms, else to the screen's.
+  The camera belongs to the loop whose mods wrote it (`cam.writer`); the other loop leaves it alone, except the
+  screen's takes it back when the game's frames stopped.
+- **Hooks' shared order:** every hook does an atomic add on the area's first word (`0xFF0000`) and keeps the old
+  value at its slot `+12` (captures also in the entry), so the page can tell which of two hooks' calls came
+  first (`order()`, `api.after`). Slots start at `0xFF0010`; `+4`..`+15` of the area stay zero (the guard).
 - **Panel:** controls stop key events from reaching the game (window capture listeners registered first), and give
   focus back on change, or arrow keys would move sliders instead of steering.
 - **Headless panel test:** Chrome's virtual time runs animation frames late, so the check runs on frames and the
