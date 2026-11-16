@@ -9,10 +9,10 @@ docs: [README.md](README.md). Mod author docs: [MODDING.md](MODDING.md). What's 
 | Path | What |
 |---|---|
 | `manifest.json` | Content scripts in the MAIN world at `document_start`, all frames. The `js` list is the load order: `lib/wasmpatch.js`, `loader.js`, then the mods. |
-| `lib/wasmpatch.js` | A small wasm binary editor: finds a lifted game function by its x86 address, puts instructions at its start. |
-| `loader.js` | Memory and module capture, the camera hook, `mem`/`game`/`v3`/`camera` helpers, calibration, mods, options, hotkeys, panel, `scan`. |
-| `mods/` | `topdown.js`, `drone.js`, `camfinder.js` (a research tool), `template.js` (an example; not in the manifest). |
-| `tests/` | `node tests/run.mjs` runs everything; `--panel` also renders the panel in headless Chrome. |
+| `lib/wasmpatch.js` | A small wasm binary editor: finds lifted game functions by their x86 addresses, puts hook instructions at their start (notify, capture, write, skip). |
+| `loader.js` | Memory and module capture, the hook system (patching, slots, guard, handles) with the camera as its own write hook, `mem`/`game`/`v3`/`camera` helpers, calibration, mods, options, hotkeys, panel, `scan`. |
+| `mods/` | `topdown.js`, `drone.js`, `camfinder.js` (a research tool), `hookprobe.js` (a tool to check hooks live), `template.js` (an example; not in the manifest). |
+| `tests/` | `node tests/run.mjs` runs everything; `--panel` also renders the panel in headless Chrome (flaky about 1 run in 5, from before 0.3.0: rerun). `fakegame.mjs` builds the game-shaped wasm module the hook tests use. |
 
 The nfsu2-web source used as the reference sits next to this folder (`../nfsu2-web`, a clone, not part of this
 repo). Its `runtime/` comments are where every address and offset here comes from.
@@ -49,8 +49,7 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   but doesn't remove it.
 - **The hook works:** the address table `g_fn_addr` was found by searching for `0x5C7EC0`. Two windows passed as
   `g_fn_ptr`; the return-address fit test picked one at `247/406 vs 1/406`. With the hook in there's no flicker.
-- **Mailbox:** `0xD0F000` is used (no flicker means `mailboxReady()` passed its zero check). Not separately
-  confirmed with the `mailbox free` console line.
+- **Mailbox (0.2.0):** `0xD0F000` was used (no flicker means the zero check passed). 0.3.0 moved it: see below.
 - **Motion blur:** with a mod camera the picture was blurred until the game's Motion Blur option `0x870CDC` was
   switched off while it shows. Now sharp (confirmed).
 - **Rain:** drops went wild until the hook also copied the camera's velocity (`+0x1E0`). The user reported it
@@ -59,9 +58,21 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   `roam_game.c` `car_sane` documents `+0x90`; that's now fixed, and only the forward row is learnt
   (`u2ml:caraxes:v2`).
 - **Drone camera:** the user reported it looks good.
+- **Hook system (0.3.0), first test:** `hooks 4 in`. Notify and capture on `0x5C7EC0` work: ~1180 view setups/s
+  at ~115 game frames/s, views 0, 1, 4, 9 (headlights) and 16–21 (cube map faces) each once a frame, no 3 (the
+  mirror) with top-down on. The captured `[esp+4]` is exactly eView `0x832DE0 + id·0x70` (view 21 at
+  `0x833710`), ecx `0x874B20`, every return address in the game's code. Notify at GameLoop `0x5811C0` counted 0:
+  GameLoop is the loop itself, entered once (see below).
 
 ## Not yet proven live
 
+- **Hooks, the per-frame call and the page's wake:** the probe's `loop` hook moved from `0x5811C0` to `0x4022C0`
+  with `ret: 0x581475` after the first live test read `loop 0/s` (GameLoop never returns: it is the loop, and
+  calls the empty `0x4022C0`, ~300 callers, once a frame; nfsu2-web `runtime/career.c`). Not yet checked live.
+- Whether the camera through the new `u2ml.camera` write hook (slot `0xFF0000`) is still flicker-free: top-down
+  was on in the first 0.3.0 test and the eye sat above the car, but flicker wasn't reported either way.
+- Whether small functions are inlined into their callers in the site's build (then a hook there misses those
+  calls). The 0.2.0 camera hook at `0x5C7EC0` did catch the main view's call.
 - The options panel (0.2.0) and the template mod: tested offline only (`tests/options`, `tests/template`, `--panel`).
 - Whether the car shakes on screen at high speed with the drone. Mods run on the page's animation frames; the game
   draws on its own thread at its own rate. Not reported either way.
@@ -84,18 +95,30 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
 - **Memory:** guest address == byte offset in the wasm memory (nfsu2-web `runtime/cpu.h`: `g_mem` is 0). The game
   is one exact SPEED2.EXE, so static addresses never move. Allocated objects move between sessions; reach them
   through pointers from fixed addresses.
-- **The hook** (`lib/wasmpatch.js` + `loader.js` `compilePatched`): `compileStreaming` is wrapped. The loader reads
+- **Hooks** (`lib/wasmpatch.js` + `loader.js` `compilePatched`): `compileStreaming` is wrapped. The loader reads
   the bytes, finds `g_fn_addr[]` (a sorted run of x86 addresses in the data segments, nfsu2-web
-  `runtime/dispatch.c`) and the parallel `g_fn_ptr[]` (function-table indices, checked to be `void(i32)`
-  functions), maps x86 `0x5C7EC0` to its wasm function, and prepends: if `[0x832E90] != 0 && [mailbox] == 1`, copy
-  the mailbox's ranges into the camera. Several `g_fn_ptr` candidates are told apart by the fit test (a lifted
-  function's code holds i32 constants inside its own x86 range: the return addresses it pushes). Any doubt throws,
-  and the original module is compiled instead.
-- **Mailbox** at `0xD0F000` (between the web build's players arrays at `0xD00000` and the module heaps at
-  `0x1000000`). `+0` flag; `+0x10` 0x70 bytes copied to camera `+0x00` (matrix, eye, forward, target with the
-  game's padding words); `+0x80` 12 bytes copied to camera `+0x1E0` (velocity). The loader checks
-  `0xD0F000`–`0xD10000` is all zero before first use.
-- **Why the hook is at `0x5C7EC0`:** it builds each view from its camera, and the main view's setup is the frame's
+  `runtime/dispatch.c`) by the anchor `0x5C7EC0`, and the parallel `g_fn_ptr[]` (function-table indices, checked
+  to be `void(i32)` functions). Each hook's address is looked up in `g_fn_addr` (binary search), and all hooks go
+  in in one rewrite of the code section, each touched function getting two scratch i32 locals. Several
+  `g_fn_ptr` candidates are told apart by the fit test (a lifted function's code holds i32 constants inside its
+  own x86 range: the return addresses it pushes). A table doubt throws and the original module is compiled; a
+  hook at a wrong address fails alone. Mods declare hooks in `register`, which runs at `document_start`, before
+  the page compiles the module; later ones are `too late`.
+- **Registers at a function's entry are current in the CPU struct**, LREGS builds included: `tools/lregs.py`
+  stores them before every call and tail jump, and `LR_ENTER` (`runtime/cpu.h`) reads them from the struct. Flags
+  are stored only when the callee reads them, so capture leaves them out. `eip` isn't maintained at entry.
+- **Hook slots** from `0xFF0000` (to `0x1000000`, the module heaps; nfsu2-web's scratch grows up from `0xD00000`
+  and ends at `0xD0F900`). **`0xD0F000` is co-op's player 2 ride** (`runtime/coop.c` `COOP_RIDE`, 0x900 bytes):
+  0.2.0's mailbox there would have copied ride bytes into the camera in co-op. A slot: `+0` on (the hooks act only
+  on the magic `ON` value, not on any nonzero word), `+4` the call count (atomic), `+8` a write's current buffer
+  or a skip's eax, `+16` a capture's ring (`[seq, 9 registers, ret, args]`, seq `2n+2` once call n is written)
+  or a write's two buffers (the page fills the back one, flips `+8`, copies front to back). The guard
+  (`hooksTick`): each frame every slot's `+0`/`+8`/`+12` must hold what the page wrote, and every 250 ms the
+  unused rest of the area must be zero; otherwise every hook goes off for good and nothing more is written.
+- **The camera hook** is the loader's own write hook `u2ml.camera` at `0x5C7EC0`: to `{ ptr: 0x832E90 }`, ranges
+  camera `+0x00` 0x70 bytes (matrix, eye, forward, target with the game's padding words) and `+0x1E0` 12 bytes
+  (velocity). `cam.set` fills and commits it; a frame with no camera written turns it off.
+- **Why the camera hook is at `0x5C7EC0`:** it builds each view from its camera, and the main view's setup is the frame's
   first (nfsu2-web `runtime/overrides.c`). Things that read the camera **earlier** in the frame (the game's own
   mover, motion blur, the rain's velocity) still see the game's camera. That's what the blur and rain fixes are
   about, and what a mod should suspect when an effect misbehaves under a mod camera.

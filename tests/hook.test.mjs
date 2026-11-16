@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');   // the u2-modloader folder
 new Function(fs.readFileSync(ROOT + '/lib/wasmpatch.js', 'utf8'))();
-const { patchGame, cameraCopy, encU, encS } = globalThis.U2WasmPatch;
+const { patchGame, prologue, ON, encU, encS } = globalThis.U2WasmPatch;
 const sec = (id, payload) => [id, ...encU(payload.length), ...payload];
 const vec = items => [...encU(items.length), ...items.flat()];
 const str = s => [...encU(s.length), ...Buffer.from(s)];
@@ -25,8 +25,10 @@ const mod = Uint8Array.from([
   ...sec(10, vec([body([]), body(store42), body([])])),
   ...sec(11, vec([[0x01, ...encU(data.length), ...data]])),                       // passive, as with shared memory
 ]);
-const MB = 0xd0f000, CAMAT = 0x832e50 + 0x40, CAM = 0x1003000;
-const r = patchGame(mod, { guestAddr: TARGET, prologue: cameraCopy(CAMAT, MB, 0x70) });
+// the loader's camera hook: a write hook to the camera ([0x832E90]), its buffer 0 at slot + 16
+const MB = 0xff0000, CAMAT = 0x832e50 + 0x40, CAM = 0x1003000;
+const camera = { guestAddr: TARGET, build: prologue.write({ slot: MB, to: { ptr: CAMAT }, ranges: [[0, 0x70]] }) };
+const r = patchGame(mod, { hooks: [camera] });
 console.log('patch info', r.info);
 const memory = new WebAssembly.Memory({ initial: 4096, maximum: 4096, shared: true });
 const { instance } = await WebAssembly.instantiate(r.bytes, { env: { memory } });
@@ -37,14 +39,14 @@ dv.setUint32(CAMAT, CAM, true);
 for (let i = 0; i < 0x70; i++) dv.setUint8(MB + 16 + i, i + 1);
 run();
 check('flag 0: camera untouched, original body ran', camBytes().every(x => x === 0) && dv.getUint32(0x900000, true) === 42);
-dv.setUint32(MB, 1, true); run();
-check('flag 1: mailbox copied into the camera', camBytes().every((x, i) => x === i + 1));
+dv.setUint32(MB, ON, true); run();
+check('flag on: mailbox copied into the camera', camBytes().every((x, i) => x === i + 1));
 dv.setUint32(MB, 0, true); for (let i = 0; i < 0x70; i++) dv.setUint8(MB + 16 + i, 0xee); run();
 check('flag 0 again: camera keeps what it had', camBytes().every((x, i) => x === i + 1));
-dv.setUint32(MB, 1, true); dv.setUint32(CAMAT, 0, true); run();
+dv.setUint32(MB, ON, true); dv.setUint32(CAMAT, 0, true); run();
 check('no camera: nothing written at address 0', new Uint8Array(memory.buffer, 0, 0x70).every(x => x === 0));
 // a module that is not the game: patchGame must refuse, not guess
-try { patchGame(Uint8Array.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sec(10, vec([body([])]))]), { guestAddr: TARGET, prologue: cameraCopy(CAMAT, MB, 0x70) }); check('refuses other modules', false); }
+try { patchGame(Uint8Array.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0, ...sec(10, vec([body([])]))]), { hooks: [camera] }); check('refuses other modules', false); }
 catch (e) { check(`refuses other modules (${e.message})`, true); }
 console.log(ok ? 'ALL OK' : 'SOME FAILED');
 process.exit(ok ? 0 : 1);

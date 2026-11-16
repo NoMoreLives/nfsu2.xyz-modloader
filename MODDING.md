@@ -18,6 +18,7 @@ every feature described here.
 - [Groups](#groups)
 - [The `api` object](#the-api-object)
 - [Camera mods](#camera-mods)
+- [Hooks: running at the game's own moments](#hooks-running-at-the-games-own-moments)
 - [The console](#the-console)
 - [Finding new things in memory](#finding-new-things-in-memory)
 - [Rules and tips](#rules-and-tips)
@@ -51,6 +52,7 @@ U2ML.register({
   group: 'camera',             // only one mod of a group is on at a time
   options: [ /* ... */ ],      // settings the panel shows under ⚙ (see Options)
   keys: { /* ... */ },         // hotkeys (see Hotkeys)
+  hooks: [ /* ... */ ],        // instructions put into the game's functions (see Hooks)
 
   init(api, store) {},                  // once, as the mod loads
   enable(api, store) {},                // each time it's switched on
@@ -264,9 +266,10 @@ Here's what the loader does behind `set`:
 
 - **The hook.** The loader adds a few instructions to the game's code as it loads, at the function that builds
   each frame's view (x86 address `0x5C7EC0`). When a mod's camera is ready, that function copies it into the
-  game's camera on the game's own thread, at the moment the view is made. That's why there's no flicker. The
-  panel's `hook` line says whether it's in.
-- **Without the hook** (`hook failed`), `set` writes the camera straight from the page. That works, but the game
+  game's camera on the game's own thread, at the moment the view is made. That's why there's no flicker. It's the
+  loader's own hook, `u2ml.camera` (a write hook, see [Hooks](#hooks-running-at-the-games-own-moments)); the
+  panel's `hooks` line says whether it's in.
+- **Without the hook** (`u2ml.camera` not in), `set` writes the camera straight from the page. That works, but the game
   rewrites the camera on its own thread every frame, so the picture flickers between the two.
 - **The camera's velocity.** `set` works out your camera's velocity from its last place and gives it to the
   game, so the rain and the raindrops on the lens behave.
@@ -282,13 +285,97 @@ overshooting, and is stable at any frame time) and keeps its smoothing **relativ
 distance at any speed. Smoothing the absolute position instead makes the camera fall further behind the faster
 you go.
 
+## Hooks: running at the game's own moments
+
+A mod's `frame` runs on the page, at the screen's rate. The game runs on its own thread. A **hook** puts a few
+instructions at the start of one of the game's functions, so something happens on the game's thread every time
+the game calls it: the call is counted, its registers and arguments are copied out, values are copied in, or the
+function is skipped.
+
+Hook code can't call your JavaScript (the game's threads are workers the extension can't reach). Each hook talks
+to the page through a small slot of shared memory, and your mod reads and writes that slot through a handle.
+
+```js
+U2ML.register({
+  id: 'mymod',
+  hooks: [
+    { name: 'frame', at: 0x4022C0, ret: 0x581475, kind: 'notify' },          // once a game frame (GameLoop's call)
+    { name: 'view', at: 0x5C7EC0, kind: 'capture', args: 1, keep: 8 },       // the view setup and its eView*
+  ],
+  frame(api, dt, store) {
+    const v = store.hooks.view.read();          // the last call: { call, eax, ecx, ..., ret, args: [eView] }
+  },
+});
+```
+
+### Declaring a hook
+
+| Field | Means |
+|---|---|
+| `name` | Letters, digits, `_`. The handle is `store.hooks.<name>`. |
+| `at` | The x86 address where a game function starts: nfsu2-web calls it `sub_005C7EC0` and so on. |
+| `kind` | `notify`, `capture`, `write` or `skip` (below). |
+| `wake` | `true`: each call also wakes the page (`wait()`). The default for `notify`, off for the others. |
+| `ret` | Only act on calls that will return to this address (`[esp]` at the call). For a function with many callers: the game's per-frame call is `at: 0x4022C0, ret: 0x581475`. |
+
+| Kind | On each call | More fields |
+|---|---|---|
+| `notify` | Counts it and wakes the page. | |
+| `capture` | Counts it and copies the registers, the return address and the first `args` stack arguments into a ring of `keep` entries. | `args` (0–32), `keep` (a power of 2, up to 256; default 1) |
+| `write` | Copies your values into the game's memory at that moment, while your mod has some committed. | `to`: `{ addr }` a fixed address, `{ ptr }` the pointer stored at an address (nothing while it's 0), or `{ reg: 'ecx' }` a register at the call, usually `this`. `ranges`: `[[offset, bytes], ...]` from there. |
+| `skip` | Returns at once, as the function's own `ret` would, with `eax` set: the game's function doesn't run. | `pop`: the bytes its `ret N` pops (0 for `ret`); `eax`: what it returns. |
+
+On one function, hooks run in the order the mods declared them, and every skip comes last, so the other hooks
+still see a skipped call.
+
+### The handle: `store.hooks.<name>`
+
+| Member | Does |
+|---|---|
+| `state` | `in`, `waiting for the game module`, `failed: …`, `too late: reload the page`, `area busy` |
+| `ready` | `true` when it's in and can be used |
+| `count()` | Calls counted so far (only while the hook was on) |
+| `wait(ms)` | A promise that resolves at the next call (or after `ms`) with the count. Needs `wake`. |
+| `enable(false)` | Switch the hook off while the mod stays on; `enable()` back on |
+| `read()` | capture: the last call, `{ call, eax, ecx, edx, ebx, esp, ebp, esi, edi, eip, ret, args }`, or `null` |
+| `since(n)` | capture: the calls numbered `n` and later that the ring still holds, oldest first (numbers start at 0) |
+| `setF32(off, x)`, `setF32s`, `setVec3`, `setU32`, `setBytes` | write: fill in values, by offset from the target |
+| `commit()` | write: the values go to the game from its next call on, and stay until `off()` |
+| `off()` | write: stop; the game's own values again |
+| `result(eax)` | skip: change what the skipped function returns |
+
+The hooks of a mod that is off do nothing; they come on with the mod. A write hook also needs a `commit()`.
+
+### Things to know
+
+- **Declare hooks in the file, not later.** The loader puts hooks in as the page compiles the game, soon after
+  the mods load. A hook declared after that says `too late: reload the page`. Changing a mod's hooks needs the
+  extension reloaded and then the game's tab.
+- **The registers are the game's own at the call.** `ecx` is `this` for the game's C++ methods; the stack
+  arguments are at `esp + 4` on (`args[0]` is `[esp + 4]`, `ret` is `[esp]`). nfsu2-web's comments say which
+  functions take what (`__thiscall(ecx = ..., [esp+4] = ...)`, `ret 0x10`). `eip` isn't kept up to date by the
+  game at a function's start; ignore it. Flags aren't captured.
+- **Skip carefully.** Only skip a function whose job you understand and whose callers only need `eax` back. Get
+  `pop` right (the `ret N` in nfsu2-web's notes): a wrong value breaks the game's stack and crashes it.
+- **A hook costs a little on every call.** A function called thousands of times a frame is better counted than
+  woken: leave `wake` off there.
+- **If `count()` stays 0** while the function should be running: it may have been called once, before your hook
+  was on, and never return (GameLoop `0x5811C0` is like that: it is the loop). Or the game reaches that code some
+  other way (a small function copied into its callers by the compiler, for one). Try a function it calls.
+- **The hook area** is `0xFF0000`–`0x1000000`. The loader checks every frame that nothing else writes there; if
+  something does, every hook goes off until the page reloads (`area busy`).
+- **Not on physics, AI, traffic, network data or saves**, for the same reasons as everything else here (see
+  Rules and tips).
+- [mods/hookprobe.js](mods/hookprobe.js) is a short working example of notify, capture and `wait`.
+
 ## The console
 
 The global `U2ML` is there for experiments in Chrome's console.
 
 | Call | Does |
 |---|---|
-| `U2ML.status()` | Memory caught? Driving? Layout known? |
+| `U2ML.status()` | Memory caught? Hooks in? Driving? Layout known? |
+| `U2ML.hooks()` | Every hook: its mod, address, kind, state, calls (as a table) |
 | `U2ML.mods` | The loaded mods (a `Map` by id); `U2ML.mods.get('drone').def` is the drone's definition |
 | `U2ML.setEnabled('drone', true)` | Switch a mod on or off |
 | `U2ML.options('drone')` | A mod's option values |
@@ -338,10 +425,9 @@ from a fixed address, as `game.car()` does.
 
 ## What the loader can't do (yet)
 
-- **Call the game's functions.** Mods can read and write memory, but can't run the game's own code. The camera
-  hook is the one place the loader changes the game's code, and only for copying the camera in.
-- **More hooks.** The hook works for any game function, but mods can't add their own yet. That would need the
-  loader to offer a way to declare "at x86 address X, do Y" before the module loads.
+- **Call the game's functions.** Mods can read and write memory and hook the game's functions, but can't make the
+  game run one of its functions for them.
+- **Hook the middle of a function.** Hooks go at a function's start only.
 - **Other browsers.** Chrome and other Chromium browsers only.
 - **Player 2.** The helpers cover player 1 only (split screen's second player isn't handled).
 - **Load mods without the manifest.** A mod has to be listed in `manifest.json` and the extension reloaded.

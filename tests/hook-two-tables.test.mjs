@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');   // the u2-modloader folder
 new Function(fs.readFileSync(ROOT + '/lib/wasmpatch.js', 'utf8'))();
-const { patchGame, cameraCopy, encU, encS } = globalThis.U2WasmPatch;
+const { patchGame, prologue, ON, encU, encS } = globalThis.U2WasmPatch;
 const sec = (id, payload) => [id, ...encU(payload.length), ...payload];
 const vec = items => [...encU(items.length), ...items.flat()];
 const str = s => [...encU(s.length), ...Buffer.from(s)];
@@ -27,15 +27,15 @@ const mod = Uint8Array.from([
   ...sec(10, vec(bodies)),
   ...sec(11, vec([[0x01, ...encU(data.length), ...data]])),
 ]);
-const MB = 0xd0f000, CAMAT = 0x832e50 + 0x40, CAM = 0x1003000;
-const r = patchGame(mod, { guestAddr: TARGET, prologue: cameraCopy(CAMAT, MB, [[16, 0, 0x70], [0x80, 0x1e0, 12]]) });
+const MB = 0xff0000, CAMAT = 0x832e50 + 0x40, CAM = 0x1003000;
+const r = patchGame(mod, { hooks: [{ guestAddr: TARGET, build: prologue.write({ slot: MB, to: { ptr: CAMAT }, ranges: [[0, 0x70], [0x1e0, 12]] }) }] });
 console.log('patch info', r.info);
 const memory = new WebAssembly.Memory({ initial: 4096, maximum: 4096, shared: true });
 const { instance } = await WebAssembly.instantiate(r.bytes, { env: { memory } });
 const dv = new DataView(memory.buffer);
-dv.setUint32(CAMAT, CAM, true); dv.setUint32(MB, 1, true);
+dv.setUint32(CAMAT, CAM, true); dv.setUint32(MB, ON, true);
 for (let i = 0; i < 0x70; i++) dv.setUint8(MB + 16 + i, i + 1);
-for (let i = 0; i < 12; i++) dv.setUint8(MB + 0x80 + i, 0xa0 + i); instance.exports.run(0); const velOk = new Uint8Array(memory.buffer, CAM + 0x1e0, 12).every((x, i) => x === 0xa0 + i) && new Uint8Array(memory.buffer, CAM + 0x70, 0x170).every(x => x === 0); console.log("velocity copied, nothing between:", velOk);
+for (let i = 0; i < 12; i++) dv.setUint8(MB + 16 + 0x70 + i, 0xa0 + i); instance.exports.run(0); const velOk = new Uint8Array(memory.buffer, CAM + 0x1e0, 12).every((x, i) => x === 0xa0 + i) && new Uint8Array(memory.buffer, CAM + 0x70, 0x170).every(x => x === 0); console.log("velocity copied, nothing between:", velOk);
 const ok = velOk && r.info.tables === 2 && r.info.funcIdx === K && dv.getUint32(0x900000, true) === 42 && new Uint8Array(memory.buffer, CAM, 0x70).every((x, i) => x === i + 1);
 console.log(ok ? 'PICKED THE RIGHT TABLE OF 2, HOOK WORKS' : 'WRONG');
 process.exit(ok ? 0 : 1);

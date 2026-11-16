@@ -4,15 +4,15 @@
 //   1. Catches the game's shared WebAssembly.Memory as the page creates it. The game's x86 memory sits at
 //      address 0 of that memory (nfsu2-web runtime/cpu.h: g_mem is 0), so game address 0x832E50 is byte
 //      0x832E50 of the buffer. The game's executable is one fixed version, so its addresses never move.
-//   2. Notes the compiled game module (does it keep function names? that decides later wasm patching).
-//   3. Runs registered mods once per animation frame, gives them memory and game helpers, hotkeys and a panel.
+//   2. Puts the mods' hooks (and its own camera hook) into the game's module as the page compiles it.
+//   3. Runs registered mods once per animation frame, gives them memory and game helpers, hooks, hotkeys and a panel.
 //
-// Console: U2ML (U2ML.status(), U2ML.mem.u32(0x8654a4), U2ML.scan.f32(1.5) ...). Panel: Alt+Shift+M.
+// Console: U2ML (U2ML.status(), U2ML.hooks(), U2ML.mem.u32(0x8654a4), U2ML.scan.f32(1.5) ...). Panel: Alt+Shift+M.
 (() => {
   'use strict';
   if (window.U2ML) return;
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.3.0';
   const log = (...a) => console.log('[u2ml]', ...a);
   const warn = (...a) => console.warn('[u2ml]', ...a);
   const MIN_GAME_PAGES = 4096;        // 256 MB: the game's memory is about 1 GB from its first menus (memory.ts)
@@ -48,40 +48,94 @@
       log(`game module caught: ${WebAssembly.Module.exports(m).length} exports, function names ${hasNames ? 'kept' : 'stripped'}`);
     } catch (e) { warn('module hook', e); }
   }
-  // ---- 2b. the camera hook: the module patched as it loads ---------------------------------------------------
-  // At the start of 0x5C7EC0, which builds each view of the frame from its camera (nfsu2-web runtime/overrides.c:
-  // the main view's is the frame's first), the patch copies a mailbox into the main view's camera while the
-  // mailbox's flag is 1. The copy runs on the game's thread at the moment the frame's view is made, so the game's
-  // camera never shows in between. Off: localStorage['u2ml:patch'] = 'false', then reload.
-  const PATCH = {
-    want: load('u2ml:patch', true), state: 'off', info: null,
-    MAILBOX: 0x00d0f000,           // above the web build's players arrays (0xD00000-0xD00200, splitscreen_mem.h),
-                                   // below the module heaps. +0 the flag, then what the hook copies:
-    // [mailbox offset, camera offset, bytes]: the matrix, eye, forward and target; and the camera's velocity
-    // (+0x1E0, m/s), which the rain moves its drops and lens drops by (nfsu2-web runtime/framerate.c F6)
-    RANGES: [[16, 0x00, 0x70], [0x80, 0x1e0, 12]],
-    VIEW_SETUP: 0x005c7ec0, CAM_PTR_AT: 0x00832e50 + 0x40, CAM_VEL: 0x1e0,
-    mailboxOk: null,               // null: not checked yet; false: something else uses it
+  // ---- 2b. hooks: the module patched as it loads -------------------------------------------------------------
+  // compileStreaming is wrapped: the loader reads the module's bytes, puts each declared hook's few instructions
+  // at the start of its game function (lib/wasmpatch.js) and compiles that instead. Hook code can't call
+  // JavaScript (the game's workers make the module's imports), so each hook talks to the page through its slot in
+  // shared memory, in the hook area. Any doubt about the module: the original is compiled, the game runs unchanged.
+  // Off: localStorage['u2ml:patch'] = 'false', then reload.
+  const W = () => globalThis.U2WasmPatch;
+  const PATCH = { want: load('u2ml:patch', true), state: 'waiting for the game module', info: null };
+  const HOOKS = {
+    // 0xFF0000-0x1000000, just below the module heaps (nfsu2-web runtime/modheap.c: 0x1000000). nfsu2-web's own
+    // scratch grows up from 0xD00000 (splitscreen_mem.h, splitscreen.c, coop.c) and ends at 0xD0F900: co-op's
+    // player 2 ride is at 0xD0F000, where 0.2.0's camera mailbox was.
+    AREA: 0x00ff0000, END: 0x01000000,
+    ANCHOR: 0x005c7ec0,              // the view setup, proven a lifted function: the game's tables are found by it
+    list: [], next: 0x00ff0000, compiled: false, busy: null, nextScan: 0,
   };
+  const KINDS = ['notify', 'capture', 'write', 'skip'];
+  const REGS = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi', 'eip'];
+  const WAITING = 'waiting for the game module';
+  function hookProblem(d) {
+    if (!d || typeof d.name !== 'string' || !/^[A-Za-z0-9_]+$/.test(d.name)) return 'a hook needs a name of letters, digits and _';
+    if (!KINDS.includes(d.kind)) return `kind must be one of ${KINDS.join(', ')}`;
+    if (!Number.isInteger(d.at) || d.at < 0x400000 || d.at >= 0x900000) return 'at must be the x86 address of a game function';
+    if (d.kind === 'capture') {
+      const keep = d.keep ?? 1, args = d.args ?? 0;
+      if (!Number.isInteger(keep) || keep < 1 || keep > 256 || (keep & (keep - 1))) return 'keep must be a power of 2, 1 to 256';
+      if (!Number.isInteger(args) || args < 0 || args > 32) return 'args must be 0 to 32';
+    }
+    if (d.kind === 'write') {
+      const to = d.to || {};
+      if (!(Number.isInteger(to.addr) || Number.isInteger(to.ptr) || REGS.slice(0, 8).includes(to.reg))) return 'to must be { addr }, { ptr } or { reg }';
+      if (!Array.isArray(d.ranges) || !d.ranges.length || !d.ranges.every(r => Array.isArray(r) && Number.isInteger(r[0]) && r[0] >= 0 &&
+        Number.isInteger(r[1]) && r[1] > 0 && r[0] + r[1] <= 0x10000)) return 'ranges must be [[offset, bytes], ...]';
+    }
+    if (d.ret != null && !(Number.isInteger(d.ret) && d.ret >= 0x400000 && d.ret < 0x900000)) return 'ret must be a return address in the game\'s code';
+    const pop = d.pop ?? 0;
+    if (d.kind === 'skip' && !(Number.isInteger(pop) && pop >= 0 && pop <= 0xffff)) return "pop must be 0 to 65535 (the bytes the function's ret pops)";
+    return null;
+  }
+  /** a hook from a mod's def.hooks (mod null: the loader's own) */
+  function declareHook(mod, d) {
+    const bad = hookProblem(d);
+    const h = {
+      id: `${mod ? mod.def.id : 'u2ml'}.${d && d.name}`, mod, name: d && d.name, kind: d && d.kind, at: d && d.at,
+      keep: d?.keep ?? 1, args: d?.args ?? 0, to: d?.to, ranges: d?.ranges, pop: d?.pop ?? 0, wakes: d?.wake ?? d?.kind === 'notify',
+      eax: (d?.eax ?? 0) >>> 0, ret: d?.ret ?? null, slot: 0, funcIdx: null,
+      state: bad ? `failed: ${bad}` : !PATCH.want ? 'off: hooks switched off (u2ml:patch)' : HOOKS.compiled ? 'too late: reload the page' : WAITING,
+      written: 0, w8: 0,           // what the page last wrote to +0 and +8 (the guard checks nothing else did)
+      user: true, writing: false, idx: 0,
+    };
+    if (bad) warn(`hook ${h.id}: ${bad}`);
+    else if (HOOKS.compiled) warn(`hook ${h.id}: the game module is already compiled; reload the page`);
+    HOOKS.list.push(h);
+    h.handle = makeHandle(h);
+    return h;
+  }
   const realCompile = WebAssembly.compile, realCS = WebAssembly.compileStreaming;
   async function compilePatched(src) {
     const resp = await src;
     let bytes;
     try { bytes = new Uint8Array(await resp.clone().arrayBuffer()); }
-    catch (e) { PATCH.state = `failed: ${e.message}`; warn('camera hook: could not read the module', e); return realCS.call(WebAssembly, resp); }
+    catch (e) { if (!HOOKS.compiled) PATCH.state = `failed: ${e.message}`; warn('hooks: could not read the module', e); return realCS.call(WebAssembly, resp); }
     try {
-      const t0 = performance.now();
-      const r = globalThis.U2WasmPatch.patchGame(bytes, {
-        guestAddr: PATCH.VIEW_SETUP,
-        prologue: globalThis.U2WasmPatch.cameraCopy(PATCH.CAM_PTR_AT, PATCH.MAILBOX, PATCH.RANGES),
-      });
+      const t0 = performance.now(), P = W();
+      const todo = HOOKS.list.filter(h => h.state === WAITING || h.state === 'in');
+      for (const h of todo) if (!h.slot) {              // given once: a second compile puts the same slots in
+        const size = (P.slotSize(h) + 15) & ~15;
+        if (HOOKS.next + size > HOOKS.END) { h.state = 'failed: the hook area is full'; warn(`hook ${h.id}: the hook area is full`); continue; }
+        h.slot = HOOKS.next; HOOKS.next += size;
+      }
+      // on one function, the skips go last: the other hooks there still see the call
+      const go = todo.filter(h => h.slot).sort((x, y) => (x.kind === 'skip') - (y.kind === 'skip'));
+      if (!go.length) throw new Error('no hooks to put in');
+      const r = P.patchGame(bytes, { anchor: HOOKS.ANCHOR, hooks: go.map(h => ({ guestAddr: h.at, build: P.prologue[h.kind](h) })) });
+      if (!r.results.some(x => x.ok)) throw new Error(`no hook could go in: ${r.results[0].error}`);
       const m = await realCompile.call(WebAssembly, r.bytes);
-      PATCH.state = 'on'; PATCH.info = r.info;
-      log(`camera hook in: function #${r.info.funcIdx} of ${r.info.functions} lifted (${(performance.now() - t0).toFixed(0)} ms)`, r.info);
+      go.forEach((h, i) => {
+        const x = r.results[i];
+        h.state = x.ok ? 'in' : `failed: ${x.error}`; h.funcIdx = x.ok ? x.funcIdx : null;
+        if (!x.ok) warn(`hook ${h.id} at 0x${h.at.toString(16)}: ${x.error}`);
+      });
+      HOOKS.compiled = true; PATCH.state = 'on'; PATCH.info = r.info;
+      log(`hooks in: ${go.filter(h => h.state === 'in').length} of ${go.length}, on ${r.info.patched} functions of ${r.info.functions} lifted ` +
+        `(${(performance.now() - t0).toFixed(0)} ms)`, r.info, go.map(h => `${h.id} ${h.kind} 0x${h.at.toString(16)}: ${h.state}${h.funcIdx != null ? ` (#${h.funcIdx})` : ''}`));
       return m;
     } catch (e) {
-      PATCH.state = `failed: ${e.message}`;
-      warn('camera hook not put in, the game runs unchanged:', e);
+      if (!HOOKS.compiled) PATCH.state = `failed: ${e.message}`;
+      warn('hooks not put in, the game runs unchanged:', e);
       return realCS.call(WebAssembly, resp);
     }
   }
@@ -92,7 +146,13 @@
       saw(fn); log(`page called WebAssembly.${fn}`);
       const go = fn === 'compileStreaming' && PATCH.want && globalThis.U2WasmPatch
         ? compilePatched(args[0]) : real.apply(this, args);
-      return go.then(m => { noteModule(m); return m; });
+      return go.then(m => {
+        noteModule(m);
+        if (m === module && !HOOKS.compiled) {             // the game's module, compiled without the hooks
+          for (const h of HOOKS.list) if (h.state === WAITING) h.state = PATCH.want ? `failed: the game module wasn't patched (${PATCH.state})` : 'off';
+        }
+        return m;
+      });
     };
   }
   for (const fn of ['instantiateStreaming', 'instantiate']) {
@@ -174,6 +234,123 @@
     hex: (a, n = 64) => { let s = ''; for (let i = 0; i < n; i++) s += mem.u8(a + i).toString(16).padStart(2, '0') + (i % 16 === 15 ? '\n' : ' '); return s; },
   };
 
+  // ---- hooks, the page's side: each hook's slot (lib/wasmpatch.js says what the game's side does) -------------
+  let ia = null, iaBuf = null;
+  function ints() { const b = memory && memory.buffer; if (!b) return null; if (b !== iaBuf) { iaBuf = b; ia = new Int32Array(b); } return ia; }
+  const aget = a => { const v = ints(); return v ? Atomics.load(v, a >> 2) >>> 0 : 0; };
+  const aset = (a, x) => { const v = ints(); if (v) Atomics.store(v, a >> 2, x | 0); };
+  const hookReady = h => h.state === 'in' && !HOOKS.busy && !!memory;
+  const hookWanted = h => h.kind === 'write' ? h.writing && (!h.mod || h.mod.on) : h.user && (!h.mod || h.mod.on);
+  /** bring the hook's slot in line with what the page wants: +8 first, then the on flag */
+  function syncHook(h) {
+    if (!hookReady(h)) return;
+    if (h.kind === 'skip' && h.w8 !== h.eax) { aset(h.slot + 8, h.eax); h.w8 = h.eax; }
+    const v = hookWanted(h) ? W().ON : 0;
+    if (v !== h.written) { aset(h.slot, v); h.written = v; }
+  }
+  /** each frame: the slots hold only what the page wrote (and the game's counts), the rest of the area is zero.
+   *  Anything else means something else uses the area: every hook off for good, nothing more written there. */
+  function hooksTick(t) {
+    if (!memory || !HOOKS.compiled || HOOKS.busy) return;
+    const live = HOOKS.list.filter(h => h.state === 'in');
+    for (const h of live) {
+      if (aget(h.slot) !== h.written) return areaBusy(h.slot);
+      if (aget(h.slot + 8) !== h.w8) return areaBusy(h.slot + 8);
+      if (aget(h.slot + 12)) return areaBusy(h.slot + 12);
+    }
+    if (t >= HOOKS.nextScan) {
+      HOOKS.nextScan = t + 250;
+      for (let a = HOOKS.next; a < HOOKS.END; a += 4) if (mem.u32(a)) return areaBusy(a);
+    }
+    for (const h of live) syncHook(h);
+  }
+  function areaBusy(at) {
+    HOOKS.busy = at;
+    for (const h of HOOKS.list) if (h.state === 'in' && aget(h.slot) === W().ON) aset(h.slot, 0);    // only our own word back
+    warn(`hooks: something else writes the hook area (at 0x${at.toString(16)}), every hook is off until the page reloads`);
+  }
+  /** what a mod gets in store.hooks.<name> */
+  function makeHandle(h) {
+    const H = {
+      get name() { return h.name; }, get kind() { return h.kind; }, get at() { return h.at; },
+      /** 'in', 'waiting for the game module', 'failed: …', 'too late: reload the page', 'area busy' */
+      get state() { return HOOKS.busy && h.state === 'in' ? 'area busy' : h.state; },
+      /** in the game and usable */
+      get ready() { return hookReady(h); },
+      /** the calls counted while it was on */
+      count: () => hookReady(h) ? aget(h.slot + 4) : 0,
+      /** switch it off (or back on) while its mod stays on */
+      enable(on = true) { h.user = !!on; syncHook(h); },
+      /** resolves with the count at the next call, or after ms. Only a notify hook (or one declared with
+       *  wake: true) wakes the page; otherwise this just waits ms. */
+      wait(ms = 1000) {
+        const v = ints();
+        if (!hookReady(h) || !h.wakes || !(v.buffer instanceof SharedArrayBuffer) || !Atomics.waitAsync) {
+          return new Promise(r => setTimeout(() => r(H.count()), h.wakes ? Math.min(ms, 100) : ms));
+        }
+        const i = (h.slot + 4) >> 2, w = Atomics.waitAsync(v, i, Atomics.load(v, i), ms);
+        return (w.async ? w.value : Promise.resolve(w.value)).then(() => H.count());
+      },
+    };
+    if (h.kind === 'capture') {
+      const size = () => W().captureEntry(h.args);
+      /** call n's entry, or null: overwritten since, or being written */
+      const entry = n => {
+        const e = h.slot + 16 + (n & (h.keep - 1)) * size(), want = (2 * n + 2) >>> 0;
+        if (aget(e) !== want) return null;
+        const x = { call: n };
+        REGS.forEach((r, i) => { x[r] = mem.u32(e + 4 + 4 * i); });
+        x.ret = mem.u32(e + 40);
+        x.args = Array.from({ length: h.args }, (_, i) => mem.u32(e + 44 + 4 * i));
+        return aget(e) === want ? x : null;
+      };
+      Object.assign(H, {
+        /** the last call: { call, eax ... edi, eip, ret, args }, or null (eip is not kept up to date by the game) */
+        read() {
+          for (let k = 0; k < 4; k++) { const c = H.count(); if (!c) return null; const x = entry(c - 1); if (x) return x; }
+          return null;
+        },
+        /** the calls from number n on that the ring still holds, oldest first (call numbers start at 0) */
+        since(n = 0) {
+          const c = H.count(), out = [];
+          for (let k = Math.max(n, c - h.keep); k < c; k++) { const x = entry(k); if (x) out.push(x); }
+          return out;
+        },
+      });
+    }
+    if (h.kind === 'write') {
+      const L = () => (h.L ||= W().writeLayout(h.ranges));
+      const buf = i => h.slot + 16 + i * L().size;
+      /** where target offset off (n bytes) goes in the buffer being filled, or 0 when no range holds it */
+      const where = (off, n) => { for (const r of L()) if (off >= r.off && off + n <= r.off + r.len) return buf(1 - h.idx) + r.at + off - r.off; return 0; };
+      Object.assign(H, {
+        setU32(off, x) { const a = where(off, 4); if (a) mem.setU32(a, x); return !!a; },
+        setF32(off, x) { const a = where(off, 4); if (a) mem.setF32(a, x); return !!a; },
+        setF32s(off, arr) { let ok = true; arr.forEach((x, i) => { ok = H.setF32(off + 4 * i, x) && ok; }); return ok; },
+        setVec3(off, v) { return H.setF32s(off, v); },
+        setBytes(off, bytes) { const a = where(off, bytes.length); if (a) new Uint8Array(memory.buffer, a, bytes.length).set(bytes); return !!a; },
+        /** what has been set goes to the game from its next call on, and stays there until off() */
+        commit() {
+          if (!hookReady(h)) return false;
+          h.idx = 1 - h.idx; aset(h.slot + 8, h.idx); h.w8 = h.idx;
+          new Uint8Array(memory.buffer).copyWithin(buf(1 - h.idx), buf(h.idx), buf(h.idx) + L().size);   // the next fill starts from it
+          h.writing = true; syncHook(h);
+          return true;
+        },
+        /** the game's own values again */
+        off() { h.writing = false; syncHook(h); },
+        get writing() { return h.writing; },
+      });
+    }
+    if (h.kind === 'skip') H.result = eax => { h.eax = eax >>> 0; syncHook(h); };
+    return H;
+  }
+  // the loader's own hook: the camera, copied in as the frame's main view is made (see cam.set)
+  const camHook = declareHook(null, { name: 'camera', kind: 'write', at: 0x005c7ec0, to: { ptr: 0x00832e50 + 0x40 },
+    // the camera's matrix, eye, forward and target; and its velocity (+0x1E0, m/s), which the rain moves its drops
+    // and lens drops by (nfsu2-web runtime/framerate.c F6)
+    ranges: [[0x00, 0x70], [0x1e0, 12]] }).handle;
+
   // ---- game helpers (addresses from nfsu2-web runtime/game.h, look.c, photo.c, splitscreen_mem.h) ----------
   const ADDR = {
     FLOW: 0x008654a4,     // game flow state: 3 front end, 4/5 loading, 6 in the world
@@ -186,7 +363,7 @@
     PL_CAR: 0x4, PL_MOVER: 0x238, MV_TYPE: 0xc,          // player: car, camera mover (type 1 drive cameras, 2 debug/photo)
     CAR_POS: 0x60,                                        // car: its centre, world
     VIEW_CAM: 0x40,
-    CAM_MATRIX: 0x00, CAM_EYE: 0x40, CAM_FWD: 0x50, CAM_TARGET: 0x60, CAM_FOV: 0xc4,   // camera (fov: u16 binary angle)
+    CAM_MATRIX: 0x00, CAM_EYE: 0x40, CAM_FWD: 0x50, CAM_TARGET: 0x60, CAM_FOV: 0xc4, CAM_VEL: 0x1e0,   // camera (fov: u16 binary angle)
   };
   const game = {
     ADDR, OFF,
@@ -277,22 +454,21 @@
       const c = game.camera();
       if (!c || !cam.layout) return false;
       const M = buildMatrix(cam.layout, eye, target, up), fwd = v3.norm(v3.sub(target, eye));
-      if (mailboxReady()) {
+      if (camHook.ready) {
         // through the hook: the game thread copies it in as it makes the frame's view (no flicker)
-        const mb = PATCH.MAILBOX + 16;
-        mem.setF32s(mb + OFF.CAM_MATRIX, M);
-        mem.setVec3(mb + OFF.CAM_EYE, eye); mem.setU32(mb + 0x4c, mem.u32(c + 0x4c));   // with the game's padding
-        mem.setVec3(mb + OFF.CAM_FWD, fwd); mem.setU32(mb + 0x5c, mem.u32(c + 0x5c));
-        mem.setVec3(mb + OFF.CAM_TARGET, target); mem.setU32(mb + 0x6c, mem.u32(c + 0x6c));
+        camHook.setF32s(OFF.CAM_MATRIX, M);
+        camHook.setVec3(OFF.CAM_EYE, eye); camHook.setU32(0x4c, mem.u32(c + 0x4c));   // with the game's padding
+        camHook.setVec3(OFF.CAM_FWD, fwd); camHook.setU32(0x5c, mem.u32(c + 0x5c));
+        camHook.setVec3(OFF.CAM_TARGET, target); camHook.setU32(0x6c, mem.u32(c + 0x6c));
         // our camera's own velocity, from its last place (smoothed: the page's frames are not the game's)
         const now = performance.now(), lp = cam.lastEye;
         const vNow = lp && now > lp.t ? v3.scale(v3.sub(eye, lp.eye), 1000 / (now - lp.t)) : [0, 0, 0];
         cam.vel = lp && lp.vel ? v3.lerp(lp.vel, vNow, 0.5) : vNow;
         if (!cam.vel.every(Number.isFinite) || v3.len(cam.vel) > 200) cam.vel = [0, 0, 0];
         cam.lastEye = { eye: eye.slice(), t: now, vel: cam.vel };
-        mem.setVec3(PATCH.MAILBOX + 0x80, cam.vel);
-        mem.setU32(PATCH.MAILBOX, 1);
-        PATCH.used = true;
+        camHook.setVec3(OFF.CAM_VEL, cam.vel);
+        camHook.commit();
+        cam.viaHook = true;
       } else {
         mem.setF32s(c + OFF.CAM_MATRIX, M);
         mem.setVec3(c + OFF.CAM_EYE, eye);
@@ -332,20 +508,6 @@
         '\nPaste this into the chat so the layout can be worked out by hand.');
     }
   }
-  /** the hook is in and its mailbox is free (checked once in the world: nothing of the game's may be there) */
-  function mailboxReady() {
-    if (PATCH.state !== 'on') return false;
-    if (PATCH.mailboxOk === null) {
-      if (!game.inWorld()) return false;
-      let used = 0;
-      for (let a = PATCH.MAILBOX; a < PATCH.MAILBOX + 0x1000; a += 4) if (mem.u32(a)) used++;
-      PATCH.mailboxOk = used === 0;
-      if (used) warn(`camera hook: the mailbox at 0x${PATCH.MAILBOX.toString(16)} is in use (${used} words), the hook stays off`);
-      else log('camera hook: mailbox free, cameras go through the hook');
-    }
-    return PATCH.mailboxOk;
-  }
-
   // ---- the car's own axes and velocity (for the cameras) -----------------------------------------------------
   // The car: +0x60 its centre, +0x70 its velocity (m/s), +0x90/+0xA0/+0xB0 its orientation's three unit rows
   // (nfsu2-web runtime/roam_game.c car_sane). Which row points forward is learnt while the car drives: the
@@ -425,7 +587,9 @@
     if (!def || !/^[a-z0-9_-]+$/.test(def.id || '')) { warn('register: a mod needs an id of a-z, 0-9, _ and -', def); return; }
     if (mods.has(def.id)) { warn(`register: ${def.id} is already loaded`); return; }
     const opts = new Map((def.options || []).filter(o => o && o.key).map(o => [o.key, o]));
-    const m = { def, on: false, opts, store: {
+    const m = { def, on: false, opts, hooks: {}, store: {
+      /** the mod's hooks by name (def.hooks): store.hooks.view.count() ... */
+      hooks: null,
       /** a value: the player's, else the option's default (or d) */
       get: (k, d) => load(`u2ml:${def.id}:${k}`, d !== undefined ? d : opts.get(k)?.default),
       /** set a value (an option's is kept within its range), tells the mod and the panel */
@@ -444,6 +608,12 @@
       /** all option values, { key: value } */
       all: () => Object.fromEntries([...opts.keys()].map(k => [k, m.store.get(k)])),
     } };
+    m.store.hooks = m.hooks;
+    for (const d of Array.isArray(def.hooks) ? def.hooks : []) {
+      const h = declareHook(m, d);
+      if (h.name && !m.hooks[h.name]) m.hooks[h.name] = h.handle;
+      else if (h.name) warn(`${def.id}: two hooks are named ${h.name}`);
+    }
     mods.set(def.id, m);
     try { def.init?.(api, m.store); } catch (e) { warn(`${def.id} init`, e); }
     setEnabled(def.id, load(`u2ml:on:${def.id}`, !!def.defaultOn), false);
@@ -456,6 +626,7 @@
     // one mod of a group at a time (the cameras: group 'camera')
     if (on && m.def.group) for (const o of mods.values()) if (o !== m && o.on && o.def.group === m.def.group) setEnabled(o.def.id, false);
     m.on = !!on;
+    for (const h of HOOKS.list) if (h.mod === m) { if (!m.on) h.writing = false; syncHook(h); }
     try { (on ? m.def.enable : m.def.disable)?.(api, m.store); } catch (e) { warn(`${id} ${on ? 'enable' : 'disable'}`, e); }
     if (remember) save(`u2ml:on:${id}`, m.on);
     log(`${m.def.name || id} ${m.on ? 'on' : 'off'}`);
@@ -467,6 +638,7 @@
   function tick(t) {
     const dt = Math.min(0.1, Math.max(0, (t - last) / 1000)); last = t;
     if (memory) {
+      try { hooksTick(t); } catch (e) { warn('hooks', e); }
       cam.writtenThisFrame = false;
       try { calibrateTick(); } catch (e) { warn('calibration', e); }
       for (const m of mods.values()) {
@@ -477,12 +649,12 @@
       try { axesTick(); } catch (e) { warn('car axes', e); }
       if (!cam.writtenThisFrame) {
         cam.wrote = null;
-        if (PATCH.used) { mem.setU32(PATCH.MAILBOX, 0); PATCH.used = false; cam.lastEye = null; }    // the game's camera back
+        if (cam.viaHook) { camHook.off(); cam.viaHook = false; cam.lastEye = null; }      // the game's camera back
         if (cam.blurWas != null) {                                                 // and the player's motion blur
           if (mem.u32(ADDR.MOTION_BLUR) === 0) mem.setU32(ADDR.MOTION_BLUR, cam.blurWas);
           cam.blurWas = null;
         }
-      } else if (cam.pump && !PATCH.used) pumpCh.port2.postMessage(0);
+      } else if (cam.pump && !cam.viaHook) pumpCh.port2.postMessage(0);
     }
     panel.update(t);
     requestAnimationFrame(tick);
@@ -513,6 +685,20 @@
   window.addEventListener('keyup', e => {
     if (swallowed.delete(e.code)) { e.preventDefault(); e.stopImmediatePropagation(); }
   }, true);
+
+  /** the panel's hooks line */
+  function hooksLine() {
+    if (!PATCH.want) return 'switched off (u2ml:patch)';
+    if (HOOKS.busy) return `off: something else uses the hook area (0x${HOOKS.busy.toString(16)})`;
+    if (!HOOKS.compiled) return PATCH.state;
+    const bad = HOOKS.list.filter(h => h.state !== 'in');
+    return `${HOOKS.list.length - bad.length} in` + (bad.length ? `; not in: ${bad.map(h => `${h.id} (${h.state})`).join(', ')}` : '');
+  }
+  /** every hook, for the console: U2ML.hooks() */
+  function hooksTable() {
+    return HOOKS.list.map(h => ({ hook: h.id, kind: h.kind, at: h.at != null ? '0x' + (h.at >>> 0).toString(16) + (h.ret != null ? ` from 0x${h.ret.toString(16)}` : '') : '-', state: h.handle.state,
+      on: hookReady(h) && h.written !== 0, calls: h.handle.count(), slot: h.slot ? '0x' + h.slot.toString(16) : '-', func: h.funcIdx }));
+  }
 
   // ---- the panel (styled through the CSSOM: the site's CSP allows no inline style sheets) -----------------
   const panel = {
@@ -630,7 +816,7 @@
       const lines = [];
       lines.push(`memory  ${memory ? Math.round(memory.buffer.byteLength / 1048576) + ' MB' : 'not caught (reload with the extension on)'}`);
       lines.push(`module  ${module ? `names ${hasNames ? 'kept' : 'stripped'}` : '-'}`);
-      lines.push(`hook    ${!PATCH.want ? 'switched off' : PATCH.state === 'on' ? (PATCH.mailboxOk === false ? 'in, mailbox busy: not used' : 'in') : PATCH.state}`);
+      lines.push(`hooks   ${hooksLine()}`);
       if (memory) {
         const p = game.carPos(), c = game.camera();
         lines.push(`flow ${game.flow()}  race ${game.raceState()}  mover ${game.moverType()}  driving ${game.driving() ? 'yes' : 'no'}`);
@@ -684,7 +870,9 @@
     VERSION, register, setEnabled, mods, mem, game, v3, camera: cam, scan,
     /** a mod's option values, or set one: U2ML.options('drone'), U2ML.options('drone', 'dist', 15) */
     options: (id, key, value) => { const m = mods.get(id); if (!m) return null; if (key !== undefined) return m.store.set(key, value); return m.store.all(); },
-    status: () => ({ memory: !!memory, module: !!module, hasNames, flow: game.flow(), driving: game.driving(), layout: cam.layout }),
+    status: () => ({ memory: !!memory, module: !!module, hasNames, hooks: hooksLine(), flow: game.flow(), driving: game.driving(), layout: cam.layout }),
+    /** every hook: its mod, address, kind, state and calls */
+    hooks: () => { const t = hooksTable(); try { console.table(t); } catch { /* no table */ } return t; },
     _test: { buildMatrix, calibrateSample },
   });
   const where = window === window.top ? 'top page' : `frame ${location.pathname}`;

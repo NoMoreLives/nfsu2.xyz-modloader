@@ -1,6 +1,7 @@
 # Roadmap
 
-What could turn the loader into a fuller mod platform, in the order planned. Nothing here is built yet.
+What could turn the loader into a fuller mod platform, in the order planned. Phase 1 is built (0.3.0) and waiting
+for its live check; nothing after it is built yet.
 Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 
 ## The limit everything works around
@@ -8,7 +9,12 @@ Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 Hook code can't call into JavaScript. The game's workers build the module's import list, and an extension can't
 run code inside workers. So every hook is a few wasm instructions that talk to the page through shared memory.
 
-## 1. A general hook system (first; the rest depends on it)
+## 1. A general hook system (first; the rest depends on it): built in 0.3.0, not yet checked live
+
+As built: [MODDING.md](MODDING.md#hooks-running-at-the-games-own-moments) for mods, [CLAUDE.md](CLAUDE.md) for how.
+The LREGS check came out fine (registers are current at entry). The slots moved to `0xFF0000`: `0xD0F000` is
+co-op's. What was planned:
+
 
 Mods declare hooks in `register`, for example `hooks: [{ at: 0x5C7EC0, kind: 'notify' }]`. The timing works: mods
 register at `document_start`, and the module is compiled later, on the start page.
@@ -32,8 +38,9 @@ at a function's entry, or capture hooks would read stale registers.
 
 ## 2. Running mods on the game's frame
 
-A notify hook on the main loop (`0x5811C0`) lets the loader run `frame` after each game frame, not each screen
-refresh. That removes the rate mismatch between the cameras and the game's drawing, and makes frame-exact mods
+A notify hook on GameLoop's once-a-frame call (`0x4022C0` with `ret: 0x581475`; GameLoop `0x5811C0` itself is
+entered once and never returns, found in the first live test) lets the loader run `frame` after each game frame,
+not each screen refresh. That removes the rate mismatch between the cameras and the game's drawing, and makes frame-exact mods
 (telemetry, timing) possible.
 
 ## 3. Game events

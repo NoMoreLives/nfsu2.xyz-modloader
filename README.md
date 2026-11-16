@@ -11,6 +11,7 @@ It comes with:
 | **Top-down camera** | Looks straight down at your car from above. |
 | **Drone camera** | Flies behind and above your car, swings round in turns, tilts into corners. |
 | **Camera finder (tool)** | A research tool: finds values in memory that change with the camera view. Not needed to play. |
+| **Hook probe (tool)** | A test tool: shows that the loader's hooks work (how often the game's main loop and view setup run). Not needed to play. |
 
 A fan project. Not affiliated with Electronic Arts or with nfsu2.xyz.
 
@@ -47,7 +48,7 @@ After that, the camera mods work.
 | Line | Good | If not |
 |---|---|---|
 | `memory` | a size, e.g. `2048 MB` | `not caught`: see [Problems](#problems) |
-| `hook` | `in` | `failed: …`: the camera mods still work but may flicker. See [Problems](#problems) |
+| `hooks` | `4 in` (a number) | `failed: …` or `not in: …`: the camera mods still work but may flicker. See [Problems](#problems) |
 | `flow` | `6` and `driving yes` while you drive | `driving no` in menus, photo mode and replays is normal |
 | `camera` | `layout known` | `learning`: drive with the normal camera for a moment |
 | `car fwd` | three numbers | `learning`: drive straight, 20 km/h or more |
@@ -107,10 +108,10 @@ the **Console** tab, and type `u2ml` in its filter box. (F12 doesn't open it her
 |---|---|
 | No panel at all | Check the extension is on in `chrome://extensions`, then reload the game's tab. |
 | `memory not caught` after pressing Play | Click the reload arrow on the extension, then reload the game's tab. |
-| `hook failed: …` | The site's game module changed in a way the loader didn't expect. The game runs unchanged and the camera mods fall back to a mode that flickers. Copy the `[u2ml]` warning from the console and report it. |
-| `in, mailbox busy: not used` | The game now uses the memory the hook needs. Same as above: report it. |
+| `hooks failed: …` | The site's game module changed in a way the loader didn't expect. The game runs unchanged and the camera mods fall back to a mode that flickers. Copy the `[u2ml]` warning from the console and report it. |
+| `hooks off: something else uses the hook area` | The game now uses the memory the hooks need. Same as above: report it. |
 | `camera learning` never finishes | Drive with the normal camera (not photo mode). After 300 frames the console prints what it found: report that. |
-| The game crashes or freezes with the hook in | In the console type `localStorage['u2ml:patch'] = 'false'` and reload. That turns the hook off. Report the console's errors. |
+| The game crashes or freezes with the hooks in | In the console type `localStorage['u2ml:patch'] = 'false'` and reload. That turns the hooks off. Report the console's errors. |
 | The picture looks blurrier when you turn a camera mod off | The camera mods turn the game's motion blur off while they show and back on afterwards. If it stays off (rare, after photo mode), set Motion Blur again in the game's Display options. |
 | Settings went wrong | Click **reset** under that mod's ⚙, or press Alt+0 for the drone. |
 
@@ -133,8 +134,9 @@ Object.keys(localStorage).filter(k => k.startsWith('u2ml:')).forEach(k => localS
 - **Reaches the game's memory.** The game is the PC game's code translated to WebAssembly, and its memory
   addresses are the PC game's own. The loader catches that memory as the page creates it, so mods can read and
   change it.
-- **Hooks the camera.** For the camera mods, the loader changes the game's code slightly as it loads. The
-  function that builds each frame's view first copies in the mod's camera when one is ready. Without this, the
+- **Hooks the camera.** For the camera mods, the loader changes the game's code slightly as it loads (mods can
+  ask for such hooks too). The function that builds each frame's view first copies in the mod's camera when one
+  is ready. Without this, the
   game and the mod would fight over the camera every frame and the picture would flicker. If anything about this
   doesn't check out, the loader leaves the game unchanged.
 - **Learns, then remembers.** It works out the camera's layout and the car's heading by watching the game, and
