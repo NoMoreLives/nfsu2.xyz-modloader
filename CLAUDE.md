@@ -9,9 +9,9 @@ docs: [README.md](README.md). Mod author docs: [MODDING.md](MODDING.md). What's 
 | Path | What |
 |---|---|
 | `manifest.json` | Content scripts in the MAIN world at `document_start`, all frames. The `js` list is the load order: `lib/wasmpatch.js`, `loader.js`, then the mods. |
-| `lib/wasmpatch.js` | A small wasm binary editor: finds lifted game functions by their x86 addresses, puts hook instructions at their start (notify, capture, write, skip). |
+| `lib/wasmpatch.js` | A small wasm binary editor: finds lifted game functions by their x86 addresses, puts hook instructions at their start (notify, capture, write, skip). A write's target: a fixed address, a pointer, a register, or one the page sets in the slot (`{ page: true }`, the buffer's first word). |
 | `loader.js` | Memory and module capture, the hook system (patching, slots, guard, handles) with the camera as its own write hook, `mem`/`game`/`v3`/`camera` helpers, calibration, mods, options, hotkeys, panel, `scan`. |
-| `mods/` | `topdown.js`, `drone.js`, `camfinder.js` (a research tool), `hookprobe.js` (a tool to check hooks live), `template.js` (an example; not in the manifest). |
+| `mods/` | `topdown.js`, `drone.js`, `rev.js` (Z held at a standstill: car `+0x434` gear held in neutral; writes the gear, an exception to the no-physics rule the user asked for), `camfinder.js` (a research tool), `hookprobe.js` (a tool to check hooks live), `template.js` (an example; not in the manifest). |
 | `tests/` | `node tests/run.mjs` runs everything; `--panel` also renders the panel in headless Chrome (flaky about 1 run in 5, from before 0.3.0: rerun). `fakegame.mjs` builds the game-shaped wasm module the hook tests use. |
 
 The nfsu2-web source used as the reference sits next to this folder (`../nfsu2-web`, a clone, not part of this
@@ -70,12 +70,30 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   frame a camera mod's camera from the frame before still shows (the write hook keeps its buffer). The drone on
   the game's frames felt slightly less jittery than on the screen's (user), so the cameras now default to
   `runOn: 'game'`. Some jitter is left: see `mods/TODO.md`. Top-down on the game's frames: looks great (user).
+- **Game events (0.5.0), third test:** every event fired: `flow`, `enterWorld`/`leaveWorld`, `countdown`,
+  `raceStart`, `pause`/`resume` (the world's clock `0x86518C` standing 4 frames; also around restarts from the
+  pause menu), `carPlaced` 3 times in each load (the grid; matched by position), `carReset` on R, `photoMode` on
+  and off (from the pause menu's Photo Mode; leaving it lands in the pause menu, so a `pause` follows), `lap` 2/2
+  and `finish` (position 1 of 4, clock 153.7 s).
+- **Race readings (0.5.0 tests):** the player is at `0xD10000` (`[0xD00000]`) and `[player + 4]` = `0xD11000`, past
+  nfsu2-web's `0xD0F900`: the private site uses more of that region. The race status's entries (`G_RACE` +0x30,
+  discord.c offsets: laps `+9`, position `+0xA` work) point to other car objects (heap, `0xA4829B0`, a World list
+  node at `+4`) whose `+0x60` equals the player's position exactly, so discord.c's `owner == [player + 4]` match
+  fails here. Race state is 4 while paused (not 6). `0x865154` (world dt) read 0 even while racing. R writes car
+  `+0x974` (0 → 63500) but doesn't call `Car::SetPosition` `0x5FBD60` (78 calls during the load only).
 - **Hook system, second test:** notify at `0x4022C0` with `ret: 0x581475` counts 117/s = the game's frame rate,
   and `Atomics.waitAsync` woke the page 117/s: the page can follow the game's frames. The drone camera through
   the `u2ml.camera` write hook at `0xFF0000` is flicker-free (user confirmed). Not exercised live yet: write hooks
   from a mod, skip, `{ reg }` targets, the guard tripping.
 
 ## Not yet proven live
+
+- **Game events, the last fixes:** no `pause` before the world's clock first moves (one fired as a world loaded
+  in), `photoMode` before `pause`. The race entry kept once found and laps against the last known didn't help:
+- **`lap`/`finish` unreliable (parked, ROADMAP "Loader infrastructure").** A monitor of `game.race()` every 2 s:
+  in a career race `laps` null for ~18 s stretches (car `0`), found again after; in a Quick Race always
+  `pl 0, car 0, n 1` (track 4012, `human` 0). So `[0xD00000]` (`game.player()`) reads 0 at times, and the race
+  lookup needs `game.car()`. Not known: whether the cameras work in a Quick Race (same pointer).
 
 
 - Whether small functions are inlined into their callers in the site's build (then a hook there misses those
@@ -84,6 +102,19 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
 - Whether the car shakes on screen at high speed with the drone. Mods run on the page's animation frames; the game
   draws on its own thread at its own rate. Not reported either way.
 - When the rain update runs relative to the hook. It works, so presumably after the main view's setup.
+- **Free rev (`mods/rev.js`).** Test 1 (page writes to car `+0x434` once a game frame): HUD gear flashing N/1,
+  revs ~2000 at times. Test 2 (also `{ page: true }` write hooks at `0x594300` and `0x5AA480`, both in): HUD shows
+  N (orange, grey on the throttle), the car doesn't move, the engine stays at 1000 rpm. Both car objects
+  (`0x9015960` the race's, `0xD11000` `game.car()`) got neutral, but `0x594300` ran ~160 times a frame (67334
+  writes in 418 frames), every captured call with `ecx = 0x934B0B0`, neither car object: the engine keeps its own
+  gear. Tests 3-4: no word or byte of that object follows the car's gear (both car objects' `+0x434` went R to
+  5th while driving; a first short drive had shown only R and first). So the engine's own neutral revving wasn't
+  found. Test 5 **works** (user, 2026-11-16: the engine revs with Z held at a standstill): neutral holds the car still (gear hooks as in test 2), and the mod makes
+  the rpm itself (throttle up to the car type's redline, `[car + 0x10] + 0x10` `+0x228`, mprace.c; a limiter
+  bounce), written to both car objects' `+0x440` by write hooks at the engine step, the sound update `0x483B40`
+  (framerate.c F4) and the sound's rpm scaling `0x484C50` (roam_game.c), so the game's engine sound plays it.
+  The first live use of mod write hooks and of `{ page: true }` targets. Not known: which of the three rpm hooks
+  the sound needs, whether the tach follows, whether friends in free roam hear it.
 - After photo mode with a mod camera on, Motion Blur may stay off (photo mode saves and restores the same flag).
 
 ## Decisions (the user's)
@@ -139,6 +170,11 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   `runOn: 'game'` mod to the game's loop while its frames came in the last 250 ms, else to the screen's.
   The camera belongs to the loop whose mods wrote it (`cam.writer`); the other loop leaves it alone, except the
   screen's takes it back when the game's frames stopped.
+- **Events** (`loader.js` "game events"): `eventsTick` runs once a frame before the mods (the game loop's while
+  it's live, else the screen's) and compares a snapshot (flow, race state, track, laps done, photo) with the last
+  frame's; entering the world counts its state as new. `carPlaced`: the loader's capture hook on `0x5FBD60`
+  (args 4, keep 16), calls whose `ecx` is `game.car()`, the race's car for the player, or a car at its position. Handlers in `def.on` run while their mod is on;
+  `U2ML.on` listeners always.
 - **Hooks' shared order:** every hook does an atomic add on the area's first word (`0xFF0000`) and keeps the old
   value at its slot `+12` (captures also in the entry), so the page can tell which of two hooks' calls came
   first (`order()`, `api.after`). Slots start at `0xFF0010`; `+4`..`+15` of the area stay zero (the guard).

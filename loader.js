@@ -12,7 +12,7 @@
   'use strict';
   if (window.U2ML) return;
 
-  const VERSION = '0.4.0';
+  const VERSION = '0.5.0';
   const log = (...a) => console.log('[u2ml]', ...a);
   const warn = (...a) => console.warn('[u2ml]', ...a);
   const MIN_GAME_PAGES = 4096;        // 256 MB: the game's memory is about 1 GB from its first menus (memory.ts)
@@ -79,7 +79,7 @@
     }
     if (d.kind === 'write') {
       const to = d.to || {};
-      if (!(Number.isInteger(to.addr) || Number.isInteger(to.ptr) || REGS.slice(0, 8).includes(to.reg))) return 'to must be { addr }, { ptr } or { reg }';
+      if (!(Number.isInteger(to.addr) || Number.isInteger(to.ptr) || REGS.slice(0, 8).includes(to.reg) || to.page === true)) return 'to must be { addr }, { ptr }, { reg } or { page: true }';
       if (!Array.isArray(d.ranges) || !d.ranges.length || !d.ranges.every(r => Array.isArray(r) && Number.isInteger(r[0]) && r[0] >= 0 &&
         Number.isInteger(r[1]) && r[1] > 0 && r[0] + r[1] <= 0x10000)) return 'ranges must be [[offset, bytes], ...]';
     }
@@ -324,7 +324,7 @@
       });
     }
     if (h.kind === 'write') {
-      const L = () => (h.L ||= W().writeLayout(h.ranges));
+      const L = () => (h.L ||= W().writeLayout(h.ranges, h.to));
       const buf = i => h.slot + 16 + i * L().size;
       /** where target offset off (n bytes) goes in the buffer being filled, or 0 when no range holds it */
       const where = (off, n) => { for (const r of L()) if (off >= r.off && off + n <= r.off + r.len) return buf(1 - h.idx) + r.at + off - r.off; return 0; };
@@ -334,6 +334,9 @@
         setF32s(off, arr) { let ok = true; arr.forEach((x, i) => { ok = H.setF32(off + 4 * i, x) && ok; }); return ok; },
         setVec3(off, v) { return H.setF32s(off, v); },
         setBytes(off, bytes) { const a = where(off, bytes.length); if (a) new Uint8Array(memory.buffer, a, bytes.length).set(bytes); return !!a; },
+        /** to { page: true }: the address the ranges' offsets count from (0: nowhere, the hook writes nothing);
+         *  like the values, it goes to the game with commit() */
+        target(addr) { if (!h.to?.page || !hookReady(h)) return false; mem.setU32(buf(1 - h.idx), addr >>> 0); return true; },
         /** what has been set goes to the game from its next call on, and stays there until off() */
         commit() {
           if (!hookReady(h)) return false;
@@ -363,6 +366,8 @@
     PLAYER1: 0x00d00000,  // -> player 1 (the web build's relocated players array)
     VIEW1: 0x00832e50,    // eView 1, the main view: +0x40 -> its camera
     MOTION_BLUR: 0x00870cdc,  // g_MotionBlurEnable, the Motion Blur option (photo.c)
+    RACEPARAMS: 0x0089e7a0,   // the race's parameters, filled before a track loads (game.h G_RACEPARAMS, discord.c R_*)
+    WORLDTIMER: 0x0086518c,   // the world's clock, 1/4000 s, a new value each world step: it stands while paused (game.h)
   };
   const OFF = {
     PL_CAR: 0x4, PL_MOVER: 0x238, MV_TYPE: 0xc,          // player: car, camera mover (type 1 drive cameras, 2 debug/photo)
@@ -370,6 +375,7 @@
     VIEW_CAM: 0x40,
     CAM_MATRIX: 0x00, CAM_EYE: 0x40, CAM_FWD: 0x50, CAM_TARGET: 0x60, CAM_FOV: 0xc4, CAM_VEL: 0x1e0,   // camera (fov: u16 binary angle)
   };
+  const raceCarKept = { rs: 0, track: null, owner: 0 };    // the race's car for the player, once found (game.race)
   const game = {
     ADDR, OFF,
     flow: () => mem.u32(ADDR.FLOW),
@@ -381,6 +387,38 @@
     moverType: () => { const p = game.player(), m = p ? mem.ptr(p + OFF.PL_MOVER) : 0; return m ? mem.u32(m + OFF.MV_TYPE) : -1; },
     camera: () => mem.ptr(ADDR.VIEW1 + OFF.VIEW_CAM),
     fovDeg: () => { const c = game.camera(); return c ? mem.u16(c + OFF.CAM_FOV) * 360 / 65536 : NaN; },
+    /** the race being run, or null outside the world. (nfsu2-web runtime/discord.c player_status: the race
+     *  parameters +0 track, +0x10 kind, +0x14 point to point, +0x1C laps, +0x38 drag, +0x39 drift; the race status
+     *  +0x14 clock (1/4000 s), +0x24 racers, +0x30 entries of 0x1F0: +0 car, +9 laps done (int8), +0xA position) */
+    race: () => {
+      if (!game.inWorld()) return null;
+      const rp = ADDR.RACEPARAMS, track = mem.u32(rp), kind = mem.u32(rp + 0x10), rs = mem.ptr(ADDR.RACE);
+      const r = { isRace: kind !== 0 && track % 1000 !== 0, track, kind, laps: mem.u32(rp + 0x1c),
+        sprint: !!mem.u32(rp + 0x14), drag: !!mem.u8(rp + 0x38), drift: !!mem.u8(rp + 0x39),
+        state: rs ? mem.u32(rs) : -1, clock: rs ? mem.u32(rs + 0x14) / 4000 : 0, racers: 0, lapsDone: null, position: null, car: 0 };
+      // the player's entry. Its car is the race's own object, not [player + 4] (on the live site [player + 4] is
+      // 0xD11000 and the entry's car a heap object at the same place, 2026-11-16), so it's found by either, or as
+      // the nearest car to the player's (the game thread moves the two one after the other, so they can be apart
+      // by a frame's travel when the page looks), and then kept for the race
+      const car = game.car(), at = game.carPos();
+      if (rs && car) {
+        const n = Math.min(6, mem.u32(rs + 0x24)), K = raceCarKept;
+        const es = [];
+        for (let i = 0; i < n; i++) { const e = rs + 0x30 + i * 0x1f0, owner = mem.u32(e); if (owner) es.push({ e, owner }); }
+        r.racers = es.length;
+        let mine = K.rs === rs && K.track === track ? es.find(x => x.owner === K.owner) : null;
+        if (!mine) mine = es.find(x => x.owner === car);
+        if (!mine && at) {
+          const d = es.map(x => ({ x, d: mem.ok(x.owner + 0x60, 12) ? v3.len(v3.sub(mem.vec3(x.owner + 0x60), at)) : Infinity })).sort((a, b) => a.d - b.d);
+          if (d.length && d[0].d < 1.5 && !(d[1] && d[1].d < 2 * d[0].d + 0.5)) mine = d[0].x;    // the clear nearest
+        }
+        if (mine) {
+          Object.assign(K, { rs, track, owner: mine.owner });
+          r.car = mine.owner; r.lapsDone = (mem.u8(mine.e + 9) << 24) >> 24; r.position = mem.u8(mine.e + 0xa);
+        }
+      }
+      return r;
+    },
     /** driving with the game's own drive camera: where a camera mod may take over */
     driving: () => game.inWorld() && game.moverType() === 1 && !!game.car() && !!game.camera(),
   };
@@ -641,6 +679,86 @@
     panel.rebuild();
   }
 
+  // ---- game events ----------------------------------------------------------------------------------------------
+  // A mod handles them in def.on: { lap(api, ev, store) { ... } }, while it's on; U2ML.on(name, fn) from the console.
+  // Most are changes in the game's state, looked at once a frame (the game's frames while they come, else the
+  // screen's) just before the mods run. carPlaced is a hook: Car::SetPosition (0x5FBD60, thiscall car, (pos*, speed,
+  // u16 heading, flag), nfsu2-web runtime/roam.c, coop.c), the game's own placing of a car: the start grid, a reset
+  // to the road, the hot-position jump (game.h G_HOTPOS).
+  const EVENT_NAMES = ['flow', 'enterWorld', 'leaveWorld', 'countdown', 'raceStart', 'pause', 'resume', 'lap', 'finish', 'photoMode', 'carPlaced', 'carReset'];
+  const STILL_FRAMES = 4;        // frames of the world's clock standing that make a pause (not a hitch)
+  const placeHook = declareHook(null, { name: 'carPlaced', kind: 'capture', at: 0x005fbd60, args: 4, keep: 16 }).handle;
+  const EV = { was: null, placeSeen: null, listeners: new Map(), log: [], clock: null, still: 0, paused: false, moved: false, laps: null };
+  const f32of = bits => { const b = new DataView(new ArrayBuffer(4)); b.setUint32(0, bits); return b.getFloat32(0); };
+  function emit(name, data, loop) {
+    const ev = { name, t: performance.now(), on: loop, frame: loop === 'game' ? GF.count : null, ...data };
+    EV.log.push(ev); if (EV.log.length > 50) EV.log.shift();
+    log(`event ${name}`, data);
+    for (const m of mods.values()) {
+      const fn = m.on && m.def.on && m.def.on[name];
+      if (typeof fn === 'function') try { fn.call(m.def, api, ev, m.store); } catch (e) { warn(`${m.def.id} on.${name}`, e); }
+    }
+    for (const fn of EV.listeners.get(name) || []) try { fn(ev); } catch (e) { warn(`U2ML.on ${name}`, e); }
+  }
+  function eventsTick(loop) {
+    const flow = game.flow(), r = game.race(), mover = game.moverType(), car = game.car();
+    const photo = !!r && mover === 2;
+    // paused: the world's clock stands for some frames, in the world, not in the countdown or photo mode (race
+    // state 6 isn't it: 4 while paused on the live site)
+    const clock = mem.u32(ADDR.WORLDTIMER);
+    if (!r) EV.moved = false;                             // out of the world: the next one starts standing
+    else if (EV.clock != null && clock !== EV.clock) EV.moved = true;
+    EV.still = r && clock === EV.clock ? EV.still + 1 : 0; EV.clock = clock;
+    if (!r || photo || r.state === 3 || !EV.moved) EV.paused = false;   // not before the world first moves (loading in)
+    else if (EV.still >= STILL_FRAMES) EV.paused = true;
+    else if (EV.still === 0) EV.paused = false;
+    const now = { flow, state: r ? r.state : -1, track: r ? r.track : null, isRace: !!(r && r.isRace),
+      lapsDone: r ? r.lapsDone : null, laps: r ? r.laps : 0, photo, paused: EV.paused,
+      reset: car ? mem.u32(car + 0x974) : 0 };
+    const was = EV.was; EV.was = now;
+    if (placeHook.ready) {
+      const at = game.carPos();
+      if (EV.placeSeen == null) EV.placeSeen = placeHook.count();       // calls before the first look aren't news
+      for (const x of placeHook.since(EV.placeSeen)) {
+        EV.placeSeen = x.call + 1;
+        // the player's car: [player + 4], the race's car for the player, or a car where the player's is
+        const mine = car && (x.ecx === car || (r && x.ecx === r.car) ||
+          (at && mem.ok(x.ecx + 0x60, 12) && v3.len(v3.sub(mem.vec3(x.ecx + 0x60), at)) < 0.5));
+        if (!mine || !was) continue;
+        const p = x.args[0];
+        emit('carPlaced', { pos: mem.ok(p, 12) ? mem.vec3(p) : null, speed: f32of(x.args[1]), heading: (x.args[2] & 0xffff) * 360 / 65536 }, loop);
+      }
+    }
+    if (!was) return;
+    if (flow !== was.flow) {
+      emit('flow', { from: was.flow, to: flow }, loop);
+      if (flow === 6) emit('enterWorld', { race: r }, loop);
+      if (was.flow === 6) emit('leaveWorld', {}, loop);
+    }
+    if (flow !== 6) return;
+    const entered = was.flow !== 6, wasState = entered ? -1 : was.state;   // just in the world: its state is news
+    if (now.state !== wasState) {
+      if (now.state === 3) emit('countdown', { race: r }, loop);
+      if (now.state === 4 && wasState === 3 && now.isRace) emit('raceStart', { race: r }, loop);
+    }
+    if (entered) { EV.laps = { track: now.track, done: now.lapsDone }; return; }
+    if (now.photo !== was.photo) emit('photoMode', { on: now.photo }, loop);
+    if (now.paused !== was.paused) emit(now.paused ? 'pause' : 'resume', {}, loop);
+    // the game's reset of the car (R: Player::ResetCar 0x6009A0, or a car out of the world 0x6012B0): each one
+    // writes a new start of the car's blink at car +0x974, game ticks (nfsu2-web runtime/walls.c, roam_game.c)
+    if (now.reset && now.reset !== was.reset) emit('carReset', { pos: game.carPos() }, loop);
+    // laps: against the last laps done known in this race (a frame that can't tell isn't a lap)
+    if (!EV.laps || EV.laps.track !== now.track) EV.laps = { track: now.track, done: now.lapsDone };
+    if (now.isRace && now.lapsDone != null) {
+      const before = EV.laps.done;
+      EV.laps.done = now.lapsDone;
+      if (before != null && now.lapsDone > before && now.lapsDone > 0) {
+        emit('lap', { lap: now.lapsDone, laps: now.laps, position: r.position, racers: r.racers, clock: r.clock }, loop);
+        if (now.laps && now.lapsDone >= now.laps) emit('finish', { position: r.position, racers: r.racers, clock: r.clock }, loop);
+      }
+    }
+  }
+
   // ---- the frames: the screen's and the game's ---------------------------------------------------------------
   // The page's animation frames come at the screen's rate; the game makes its frames on its own thread at its own
   // rate. GameLoop (0x5811C0) calls the empty 0x4022C0 once a frame, returning to 0x581475 (nfsu2-web
@@ -679,6 +797,7 @@
     if (memory) {
       try { hooksTick(t); } catch (e) { warn('hooks', e); }
       try { calibrateTick(); } catch (e) { warn('calibration', e); }
+      if (!gameLive()) try { eventsTick('screen'); } catch (e) { warn('events', e); }
       runMods('screen', dt, { on: 'screen' });
       try { axesTick(); } catch (e) { warn('car axes', e); }
     }
@@ -697,6 +816,7 @@
       const dt = first ? 0 : Math.min(0.1, (now - GF.t) / 1000);
       GF.count = c; GF.t = now; GF.lastWake = now;
       if (now - GF.from >= 1000) { GF.rate = { frames: GF.frames * 1000 / (now - GF.from), runs: GF.runs * 1000 / (now - GF.from), missed: GF.missed }; GF.frames = GF.runs = GF.missed = 0; GF.from = now; }
+      try { eventsTick('game'); } catch (e) { warn('events', e); }
       try { runMods('game', dt, { on: 'game', frame: c, order: frameHook.order() }); } catch (e) { warn('game frame', e); }
     }
   }
@@ -866,6 +986,8 @@
       lines.push(`module  ${module ? `names ${hasNames ? 'kept' : 'stripped'}` : '-'}`);
       lines.push(`hooks   ${hooksLine()}`);
       lines.push(`frames  ${framesLine()}`);
+      const le = EV.log.at(-1);
+      lines.push(`event   ${le ? `${le.name}${le.name === 'lap' ? ` ${le.lap}/${le.laps}` : le.name === 'finish' ? ` ${le.position}/${le.racers}` : ''}, ${((performance.now() - le.t) / 1000).toFixed(0)} s ago` : '-'}`);
       if (memory) {
         const p = game.carPos(), c = game.camera();
         lines.push(`flow ${game.flow()}  race ${game.raceState()}  mover ${game.moverType()}  driving ${game.driving() ? 'yes' : 'no'}`);
@@ -930,6 +1052,16 @@
     after: (a, b) => ((a - b) | 0) > 0,
     /** the frame rates: { screen, game: { frames, runs, missed } } per second */
     frames: () => ({ screen: SF.rate, game: gameLive() ? GF.rate : null }),
+    /** listen to a game event from the console: U2ML.on('lap', e => console.log(e)); returns a function that stops it */
+    on: (name, fn) => {
+      if (!EVENT_NAMES.includes(name)) { warn(`on: no event ${name} (${EVENT_NAMES.join(', ')})`); return () => {}; }
+      if (!EV.listeners.has(name)) EV.listeners.set(name, new Set());
+      EV.listeners.get(name).add(fn);
+      return () => EV.listeners.get(name).delete(fn);
+    },
+    /** the last 50 events */
+    events: () => EV.log.slice(),
+    EVENTS: EVENT_NAMES,
     /** every hook: its mod, address, kind, state and calls */
     hooks: () => { const t = hooksTable(); try { console.table(t); } catch { /* no table */ } return t; },
     _test: { buildMatrix, calibrateSample },

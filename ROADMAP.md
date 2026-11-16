@@ -1,7 +1,7 @@
 # Roadmap
 
 What could turn the loader into a fuller mod platform, in the order planned. Phases 1 (0.3.0) and 2 (0.4.0) are built
-and proven on the live site; nothing after them is built yet. To-dos for the mods themselves (not the loader)
+and proven on the live site; phase 3 (0.5.0) is built and works live, except laps (a to-do below); nothing after it is built yet. To-dos for the mods themselves (not the loader)
 are in [mods/TODO.md](mods/TODO.md).
 Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 
@@ -49,7 +49,13 @@ entered once and never returns, found in the first live test) lets the loader ru
 not each screen refresh. That removes the rate mismatch between the cameras and the game's drawing, and makes frame-exact mods
 (telemetry, timing) possible.
 
-## 3. Game events
+## 3. Game events: built in 0.5.0, proven live except `lap`/`finish` (to do, under Loader infrastructure)
+
+As built: [MODDING.md](MODDING.md#game-events). State changes are looked at once a frame (flow, race state, laps
+and position from nfsu2-web `discord.c`'s reading of the race, photo mode); `carPlaced` is a capture hook on
+`Car::SetPosition` `0x5FBD60`. The drone starts again behind the car on `carPlaced`. Left out for now: drift
+scores, the pause menu by its screen (the race state's 6 stands in), events for player 2. What was planned:
+
 
 Notify and capture hooks on functions nfsu2-web names: the race settings `0x4FE9F0` and the race setups listed in
 `runtime/cameras.c`; drift events; the car's respawn (`car_rescue` in `roam_game.c`); the pause menu; photo mode
@@ -84,6 +90,13 @@ shown: colour grading, CRT, sharpening, letterboxing. Look at how the site prese
 - **Input:** wrap `navigator.getGamepads` and keyboard events to read or inject controls.
 
 ## Loader infrastructure
+
+- **To do: `lap` and `finish` are unreliable** (parked 2026-11-16, phase 3). They find the player's racer entry
+  through the player at `[0xD00000]`, which reads 0 at times: for ~18 s stretches in a career race, and the
+  whole of one Quick Race (`pl` 0, `car` 0, one entry). Ideas: the race parameters' player index (`0x89E7A0 +
+  0x68`, discord.c `R_HUMAN`: 0 in both tests, and the player was entry 0 in the career race) instead of the
+  car; find where Quick Race keeps player 1 (dump `0xD00000`..`0xD00040` while driving one). Also check the
+  cameras in a Quick Race: they find the car through the same pointer.
 
 - **Site updates:** record the module's `rev` (from `game.json`) with the hook positions found for it. Faster
   loads, and the panel can say when the site's module changed.

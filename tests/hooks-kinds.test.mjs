@@ -21,10 +21,11 @@ const hooks = [
   { guestAddr: FN.race, build: P.skip({ slot: S.skip, pop: 8 }) },
   { guestAddr: FN.nop, build: P.notify({ slot: 0xff0500, ret: 0x581475 }) },       // only GameLoop's call
   { guestAddr: FN.nop, build: P.notify({ slot: 0xff0510, wakes: false }) },        // every call, no wake
+  { guestAddr: FN.nop, build: P.write({ slot: 0xff0600, to: { page: true }, ranges: [[0x434, 4]] }) },   // a target the page sets
 ];
 const r = W.patchGame(buildGame(W), { anchor: FN.view, hooks });
 console.log('patch info', r.info);
-check('the wrong address fails alone', r.results.map(x => x.ok).join() === 'true,true,true,true,false,true,true,true,true' && /not the start/.test(r.results[4].error));
+check('the wrong address fails alone', r.results.map(x => x.ok).join() === 'true,true,true,true,false,true,true,true,true,true' && /not the start/.test(r.results[4].error));
 check('four functions patched in one pass', r.info.patched === 4);
 
 const memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared: true });
@@ -95,6 +96,22 @@ setTimeout(() => X.fNop(CPU), 5);
 const alive = setTimeout(() => {}, 500);                   // Node doesn't wait for a waitAsync timeout alone
 check('wakes: false does not wake the page', await w2.value === 'timed-out' && u32(0xff0510 + 4) === 5);
 clearTimeout(alive);
+
+// write to { page: true }: the target is the buffer's first word, the ranges after it
+{
+  const PW = 0xff0600, L = W.writeLayout([[0x434, 4]], { page: true }), T2 = 0x1004000;
+  check('page target: the ranges start after the address word', L[0].at === 4 && L.size === 8 && W.slotSize({ kind: 'write', ranges: [[0x434, 4]], to: { page: true } }) === 32);
+  set(PW + 16, T2); set(PW + 20, 1); set(PW + 16 + L.size, T2 + 0x100); set(PW + 20 + L.size, 7);
+  set(STACK, 0x4d0000); X.fNop(CPU);
+  check('page target, off: nothing written', u32(T2 + 0x434) === 0);
+  set(PW, ON); X.fNop(CPU);
+  check('page target: buffer 0 to its address + 0x434', u32(T2 + 0x434) === 1 && u32(PW + 4) === 1);
+  Atomics.store(ia, (PW + 8) >> 2, 1); X.fNop(CPU);
+  check('page target: after the flip, buffer 1 to its own address', u32(T2 + 0x100 + 0x434) === 7);
+  set(PW + 16 + L.size, 0); X.fNop(CPU);
+  check('page target 0: skipped', u32(PW + 4) === 2);
+  set(PW, 0);
+}
 
 // a module that is not the game: patchGame refuses, not guesses
 try { W.patchGame(Uint8Array.from([0, 0x61, 0x73, 0x6d, 1, 0, 0, 0]), { anchor: FN.view, hooks }); check('refuses other modules', false); }

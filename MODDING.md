@@ -18,6 +18,7 @@ every feature described here.
 - [Groups](#groups)
 - [The `api` object](#the-api-object)
 - [Camera mods](#camera-mods)
+- [Game events](#game-events)
 - [Hooks: running at the game's own moments](#hooks-running-at-the-games-own-moments)
 - [The console](#the-console)
 - [Finding new things in memory](#finding-new-things-in-memory)
@@ -53,6 +54,7 @@ U2ML.register({
   options: [ /* ... */ ],      // settings the panel shows under ⚙ (see Options)
   keys: { /* ... */ },         // hotkeys (see Hotkeys)
   hooks: [ /* ... */ ],        // instructions put into the game's functions (see Hooks)
+  on: { /* ... */ },           // game events: lap(api, ev, store) {} and so on (see Game events)
 
   init(api, store) {},                  // once, as the mod loads
   enable(api, store) {},                // each time it's switched on
@@ -295,6 +297,46 @@ overshooting, and is stable at any frame time) and keeps its smoothing **relativ
 distance at any speed. Smoothing the absolute position instead makes the camera fall further behind the faster
 you go.
 
+## Game events
+
+A mod handles the game's events in `on`, while it's on:
+
+```js
+U2ML.register({
+  id: 'laps',
+  on: {
+    lap(api, ev) { api.log(`lap ${ev.lap} of ${ev.laps}, ${ev.position}. place, ${ev.clock.toFixed(1)} s`); },
+    carPlaced(api, ev) { /* the game moved the car: start any smoothing again */ },
+  },
+});
+```
+
+| Event | When | `ev` has |
+|---|---|---|
+| `flow` | The game's flow state changes (3 the front end, 4 and 5 loading, 6 the world) | `from`, `to` |
+| `enterWorld` / `leaveWorld` | Into the world (a race, free roam) / out of it | `race` (enterWorld) |
+| `countdown` | A race's countdown begins | `race` |
+| `raceStart` | The countdown is over: go | `race` |
+| `pause` / `resume` | The world stands still / moves again (the pause menu; a network race doesn't pause) | |
+| `lap` | The player finished a lap. **Unreliable for now:** missed when the loader can't find the player (a known to-do) | `lap` (laps done), `laps`, `position`, `racers`, `clock` (s) |
+| `finish` | The player finished the race (after its last `lap`). Unreliable, as `lap` | `position`, `racers`, `clock` |
+| `photoMode` | Photo mode on or off | `on` |
+| `carPlaced` | The game placed the player's car: the start grid, a jump | `pos`, `speed`, `heading` (degrees) |
+| `carReset` | The game reset the car onto the road: R, or a car that fell out of the world | `pos` |
+
+Every `ev` also has `name`, `t` (`performance.now()`), `on` (`'game'` or `'screen'`: which frames saw it) and
+`frame` (the game frame's number, on the game's frames).
+
+Most events are changes in the game's state, looked at once a frame just before the mods run: on the game's
+frames while they come, else on the screen's. `pause` is the world's clock (`0x86518C`) standing for 4 frames.
+`carReset` is a new value at car `+0x974` (the reset's blink). `carPlaced` comes from a hook on the game's
+`Car::SetPosition` (`0x5FBD60`). `race` is `api.game.race()`: `{ isRace, track, kind, laps, sprint, drag, drift, state, clock,
+racers, lapsDone, position, car }`, or `null` outside the world. Its `car` is the race's object for the player's
+car, which isn't `game.car()` on the live site (both hold the same position).
+
+In the console: `U2ML.on('lap', e => console.log(e))` (it returns a function that stops it), `U2ML.events()` for
+the last 50, and the panel's `event` line shows the last one. Every event is also logged as `[u2ml] event …`.
+
 ## Hooks: running at the game's own moments
 
 A mod's `frame` runs on the page, at the screen's rate. The game runs on its own thread. A **hook** puts a few
@@ -332,7 +374,7 @@ U2ML.register({
 |---|---|---|
 | `notify` | Counts it and wakes the page. | |
 | `capture` | Counts it and copies the registers, the return address and the first `args` stack arguments into a ring of `keep` entries. | `args` (0–32), `keep` (a power of 2, up to 256; default 1) |
-| `write` | Copies your values into the game's memory at that moment, while your mod has some committed. | `to`: `{ addr }` a fixed address, `{ ptr }` the pointer stored at an address (nothing while it's 0), or `{ reg: 'ecx' }` a register at the call, usually `this`. `ranges`: `[[offset, bytes], ...]` from there. |
+| `write` | Copies your values into the game's memory at that moment, while your mod has some committed. | `to`: `{ addr }` a fixed address, `{ ptr }` the pointer stored at an address (nothing while it's 0), `{ reg: 'ecx' }` a register at the call, usually `this`, or `{ page: true }` an address your mod sets with `target(addr)` (for an object that moves between sessions, like the player's car). `ranges`: `[[offset, bytes], ...]` from there. |
 | `skip` | Returns at once, as the function's own `ret` would, with `eax` set: the game's function doesn't run. | `pop`: the bytes its `ret N` pops (0 for `ret`); `eax`: what it returns. |
 
 On one function, hooks run in the order the mods declared them, and every skip comes last, so the other hooks
@@ -351,6 +393,7 @@ still see a skipped call.
 | `read()` | capture: the last call, `{ call, order, eax, ecx, edx, ebx, esp, ebp, esi, edi, eip, ret, args }`, or `null` |
 | `since(n)` | capture: the calls numbered `n` and later that the ring still holds, oldest first (numbers start at 0) |
 | `setF32(off, x)`, `setF32s`, `setVec3`, `setU32`, `setBytes` | write: fill in values, by offset from the target |
+| `target(addr)` | write with `to: { page: true }`: the address the ranges count from (0: nowhere); goes to the game with `commit()` |
 | `commit()` | write: the values go to the game from its next call on, and stay until `off()` |
 | `off()` | write: stop; the game's own values again |
 | `result(eax)` | skip: change what the skipped function returns |
@@ -388,6 +431,7 @@ The global `U2ML` is there for experiments in Chrome's console.
 | `U2ML.status()` | Memory caught? Hooks in? Driving? Layout known? |
 | `U2ML.hooks()` | Every hook: its mod, address, kind, state, calls (as a table) |
 | `U2ML.frames()` | The screen's frame rate and the game's |
+| `U2ML.on('lap', fn)` / `U2ML.events()` | Listen to a game event / the last 50 events |
 | `U2ML.runOn('drone', 'game')` | Run a mod on the game's frames (`'screen'`: back); saved |
 | `U2ML.mods` | The loaded mods (a `Map` by id); `U2ML.mods.get('drone').def` is the drone's definition |
 | `U2ML.setEnabled('drone', true)` | Switch a mod on or off |

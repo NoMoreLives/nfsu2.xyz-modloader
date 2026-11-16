@@ -10,6 +10,7 @@ It comes with:
 |---|---|
 | **Top-down camera** | Looks straight down at your car from above. |
 | **Drone camera** | Flies behind and above your car, swings round in turns, tilts into corners. |
+| **Free rev** | Hold Z while stopped and press the accelerator: the engine revs and the car stays put. |
 | **Camera finder (tool)** | A research tool: finds values in memory that change with the camera view. Not needed to play. |
 | **Hook probe (tool)** | A test tool: shows that the loader's hooks work (how often the game's main loop and view setup run). Not needed to play. |
 
@@ -49,7 +50,8 @@ After that, the camera mods work.
 |---|---|---|
 | `memory` | a size, e.g. `2048 MB` | `not caught`: see [Problems](#problems) |
 | `frames` | `screen 120/s  game 117/s` | `game no hook` or `game waiting`: mods meant for the game's frames run on the screen's |
-| `hooks` | `5 in` (a number) | `failed: …` or `not in: …`: the camera mods still work but may flicker. See [Problems](#problems) |
+| `event` | the last game event, e.g. `lap 1/3, 4 s ago` | `-` until something happens |
+| `hooks` | `6 in` (a number) | `failed: …` or `not in: …`: the camera mods still work but may flicker. See [Problems](#problems) |
 | `flow` | `6` and `driving yes` while you drive | `driving no` in menus, photo mode and replays is normal |
 | `camera` | `layout known` | `learning`: drive with the normal camera for a moment |
 | `car fwd` | three numbers | `learning`: drive straight, 20 km/h or more |
@@ -80,6 +82,19 @@ The camera mods only take over while you drive. In menus, photo mode and replays
 | Alt+] / Alt+[ | Fly round the car, 45° at a time (side and front views) |
 | Alt+0 | All its settings back to the defaults |
 | Alt+B | Corner tilt on / off |
+
+**Free rev**
+
+| Key | Does |
+|---|---|
+| Hold Z, then accelerate | Revs the engine while the car stands still (the gearbox is held in neutral). Let go of Z to drive off. |
+
+The revs are the game's own engine sound, climbing with the throttle to a limiter at the car's redline (the
+Redline setting under ⚙ is used if the car's can't be read).
+
+While the mod is on, Z doesn't reach the site in the world (its Z is "Invite to a race"): switch the mod off in the
+panel to invite with Z. Typing in chat isn't affected. Not during a race's countdown, where the game lets you rev
+anyway.
 
 ### Settings
 

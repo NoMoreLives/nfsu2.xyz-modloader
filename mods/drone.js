@@ -56,6 +56,8 @@
     },
     enable() { S = null; },
     disable() { S = null; },
+    // the game put the car somewhere (a reset to the road, the start grid): start again behind it, no swing
+    on: { carPlaced() { S = null; }, carReset() { S = null; } },
     frame(api, dt, store) {
       const { game, camera, v3 } = api;
       if (!game.driving() || !camera.layout || dt <= 0) return;
