@@ -18,6 +18,7 @@ every feature described here.
 - [Groups](#groups)
 - [The `api` object](#the-api-object)
 - [Camera mods](#camera-mods)
+- [Drawing over the game: the overlay](#drawing-over-the-game-the-overlay)
 - [Game events](#game-events)
 - [Hooks: running at the game's own moments](#hooks-running-at-the-games-own-moments)
 - [The console](#the-console)
@@ -61,6 +62,7 @@ U2ML.register({
   disable(api, store) {},               // each time it's switched off
   runOn: 'screen',             // 'game': frame runs once per game frame instead (see The life cycle)
   frame(api, dt, store, info) {},       // every frame while it's on (info.on: 'screen' or 'game')
+  draw(api, g, store, info) {},         // every screen frame while it's on: draw your HUD (see the overlay)
   onOption(key, value, api, store) {},  // an option changed
   status(api, store) { return '...' },  // a line in the panel while it's on
 });
@@ -248,7 +250,7 @@ for a zero vector), `lerp(a, b, t)`.
 
 | Call | Does |
 |---|---|
-| `camera.set(eye, target, up)` | Puts this frame's camera at `eye`, looking at `target`. `up` is the picture's up direction (default `[0, 0, 1]`; tilt it for a roll). Returns `false` if it can't yet. |
+| `camera.set(eye, target, up, lens)` | Puts this frame's camera at `eye`, looking at `target`. `up` is the picture's up direction (default `[0, 0, 1]`; tilt it for a roll). `lens` (optional): `{ zoom }` times the game's own field of view (2: half the angle) or `{ fov }` in degrees, `near` and `far` planes in m, `minFar` (raise the far plane to at least this, never lower it). What it leaves out stays the game's, and the game's lens comes back when the mod stops. Returns `false` if it can't yet. |
 | `camera.layout` | Set once the loader has learnt the camera's matrix layout; `set` needs it |
 | `camera.gameCamera()` | The game's own camera this frame (`eye`, `target`, `fwd`, `matrix`), or `null` while the camera shows a mod's |
 | `camera.keepBlur` | `true` keeps the game's motion blur on while a mod's camera shows (it's off by default: see below) |
@@ -257,6 +259,10 @@ for a zero vector), `lerp(a, b, t)`.
 ### `api.log`, `api.warn`
 
 Like `console.log` and `console.warn`, with a `[u2ml]` prefix so the console's `u2ml` filter shows them.
+
+### `api.overlay`: drawing over the game
+
+See [Drawing over the game](#drawing-over-the-game-the-overlay).
 
 ## Camera mods
 
@@ -296,6 +302,62 @@ Smooth motion: [mods/drone.js](mods/drone.js) has a critically damped spring (it
 overshooting, and is stable at any frame time) and keeps its smoothing **relative to the car**, so it holds its
 distance at any speed. Smoothing the absolute position instead makes the camera fall further behind the faster
 you go.
+
+## Drawing over the game: the overlay
+
+The loader keeps a layer of canvases over the whole game window (above the game, below the panel). It follows the
+game into fullscreen, as the panel does. Two ways to use it:
+
+**A HUD: `draw`.** Give the mod a `draw(api, g, store, info)`. Every screen frame while the mod is on, the loader
+clears the shared HUD canvas and calls each mod's `draw` with its 2D context `g` (a plain
+[CanvasRenderingContext2D](https://developer.mozilla.org/docs/Web/API/CanvasRenderingContext2D)), already scaled
+so you draw in CSS pixels, saved before and restored after your call. `info` is `{ t, dt, width, height }` (the
+window's size in CSS pixels). The HUD never takes the mouse or keys: the game gets them.
+
+```js
+draw(api, g, store, { width, height }) {
+  const v = api.game.carVel();
+  if (!v || !api.game.inWorld()) return;
+  g.font = '600 28px system-ui'; g.fillStyle = '#fff'; g.textAlign = 'right';
+  g.fillText(`${(api.v3.len(v) * 3.6).toFixed(0)} km/h`, width - 24, height - 24);
+},
+```
+
+**A screen of your own: `api.overlay.layer(name, opts)`.** Your own canvas, hidden until you show it, drawn by its
+`draw` each screen frame while shown. Make it in `init`. [mods/map.js](mods/map.js) uses one for its map.
+
+```js
+const layer = api.overlay.layer('mymap', {
+  z: 10,                       // above layers with a lower z (the HUD is 0)
+  mod: 'mymod',                // hidden while this mod is off, and not drawn then
+  interactive: true,           // takes the mouse while shown (the game doesn't see those clicks)
+  draw(g, layer, info) { g.fillStyle = 'rgba(0,0,0,.8)'; g.fillRect(0, 0, layer.width, layer.height); },
+  keys(e) { if (e.code === 'Escape') { layer.hide(); return true; } return false; },   // true: the key was yours
+});
+layer.on('pointerdown', e => { /* e.clientX, e.clientY */ });
+// later, from a hotkey: layer.toggle()
+```
+
+| Layer member | Does |
+|---|---|
+| `show(on)`, `hide()`, `toggle()`, `shown` | Show or hide it |
+| `interactive(on)` | Take the mouse while shown (`true`) or let it through to the game |
+| `on(type, fn)` | A mouse or pointer listener (`pointerdown`, `pointermove`, `pointerup`, `wheel`, ...) |
+| `begin()` | Clear it and get its context scaled to CSS pixels (the loader does this before its `draw`) |
+| `width`, `height`, `dpr` | Its size in CSS pixels, and the device pixel ratio |
+| `canvas`, `ctx` | The canvas element and its 2D context (null until the page has a body) |
+| `draw`, `keys` | The callbacks from the options; you can set them later |
+
+`keys(e)` gets every key press while the layer is shown (before hotkeys and the game). Return `true` for a key
+you used: nobody else sees it, its release included. Return `false` and it goes on as usual, so the player can
+still drive with the map open. Alt+Shift+M (the panel) never reaches a layer. In the console,
+`U2ML.overlay.layers()` lists the layers.
+
+Draw on screen frames only, and keep it cheap: build anything big (a `Path2D` of a whole road network) once and
+reuse it. A `draw` that throws switches its mod off, as `frame` does; a layer's `draw` that throws hides the layer.
+
+**Fullscreen:** if the site ever makes the game's `<canvas>` itself fullscreen (not an element around it), nothing
+can show over it, the panel included; the loader warns once in the console.
 
 ## Game events
 
@@ -366,7 +428,7 @@ U2ML.register({
 |---|---|
 | `name` | Letters, digits, `_`. The handle is `store.hooks.<name>`. |
 | `at` | The x86 address where a game function starts: nfsu2-web calls it `sub_005C7EC0` and so on. |
-| `kind` | `notify`, `capture`, `write` or `skip` (below). |
+| `kind` | `notify`, `capture`, `write`, `skip` or `call` (below). |
 | `wake` | `true`: each call also wakes the page (`wait()`). The default for `notify`, off for the others. |
 | `ret` | Only act on calls that will return to this address (`[esp]` at the call). For a function with many callers: the game's per-frame call is `at: 0x4022C0, ret: 0x581475`. |
 
@@ -376,6 +438,7 @@ U2ML.register({
 | `capture` | Counts it and copies the registers, the return address and the first `args` stack arguments into a ring of `keep` entries. | `args` (0–32), `keep` (a power of 2, up to 256; default 1) |
 | `write` | Copies your values into the game's memory at that moment, while your mod has some committed. | `to`: `{ addr }` a fixed address, `{ ptr }` the pointer stored at an address (nothing while it's 0), `{ reg: 'ecx' }` a register at the call, usually `this`, or `{ page: true }` an address your mod sets with `target(addr)` (for an object that moves between sessions, like the player's car). `ranges`: `[[offset, bytes], ...]` from there. |
 | `skip` | Returns at once, as the function's own `ret` would, with `eax` set: the game's function doesn't run. | `pop`: the bytes its `ret N` pops (0 for `ret`); `eax`: what it returns. |
+| `call` | When your mod asks (`call()`), makes the game call **another** of its functions, `fn`, there and then, on the game's thread; then the hooked function runs as usual. | `fn`: the address of the function to call; `args`: how many stack arguments it takes (0–8). |
 
 On one function, hooks run in the order the mods declared them, and every skip comes last, so the other hooks
 still see a skipped call.
@@ -397,6 +460,8 @@ still see a skipped call.
 | `commit()` | write: the values go to the game from its next call on, and stay until `off()` |
 | `off()` | write: stop; the game's own values again |
 | `result(eax)` | skip: change what the skipped function returns |
+| `call(ecx, [args], { timeout })` | call: a promise of what `fn` returned (`eax`, unsigned), or `null` if the game didn't make the call within `timeout` ms (default 3000; the request is then taken back) |
+| `pending` | call: requests not finished yet |
 
 The hooks of a mod that is off do nothing; they come on with the mod. A write hook also needs a `commit()`.
 
@@ -421,6 +486,28 @@ The hooks of a mod that is off do nothing; they come on with the mod. A write ho
 - **Not on physics, AI, traffic, network data or saves**, for the same reasons as everything else here (see
   Rules and tips).
 - [mods/hookprobe.js](mods/hookprobe.js) is a short working example of notify, capture and `wait`.
+
+### Calling the game's own functions
+
+A `call` hook asks the game to run one of its functions for you, between two of its frames, the way nfsu2-web's
+own code does (`runtime/guest.h` `guest_call_ex`, from its once-a-frame hook). Put it on the per-frame call:
+
+```js
+hooks: [{ name: 'apOn', at: 0x4022C0, ret: 0x581475, kind: 'call', fn: 0x5FAE20 }],   // Player::AutoPilotOn(this)
+// later:
+const eax = await store.hooks.apOn.call(api.game.player());      // ecx = this; stack arguments: call(ecx, [a, b])
+```
+
+At GameLoop's next call of `0x4022C0` the hook keeps the registers, makes a stack 256 bytes below the current
+one, pushes your arguments and a return address (`ret`, here GameLoop's `0x581475`: some functions look at their
+caller's), sets `ecx`, runs `fn`, keeps `eax` and puts every register back. Any calling convention works
+(`thiscall`, `stdcall`, `cdecl`): the stack pointer is put back whatever the function pops. Requests run one per
+frame, in order. The hook is on only while a request is out, so it costs nothing otherwise, and a mod's `disable`
+can still call (to undo something it started).
+
+Only call a function whose job and arguments nfsu2-web documents, at a moment it can run (the per-frame call is
+between frames, where nfsu2-web itself calls the game). A wrong argument there crashes the game, as a wrong `pop`
+does for a skip.
 
 ## The console
 
@@ -482,8 +569,6 @@ from a fixed address, as `game.car()` does.
 
 ## What the loader can't do (yet)
 
-- **Call the game's functions.** Mods can read and write memory and hook the game's functions, but can't make the
-  game run one of its functions for them.
 - **Hook the middle of a function.** Hooks go at a function's start only.
 - **Other browsers.** Chrome and other Chromium browsers only.
 - **Player 2.** The helpers cover player 1 only (split screen's second player isn't handled).

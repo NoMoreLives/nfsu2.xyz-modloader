@@ -9,10 +9,10 @@ docs: [README.md](README.md). Mod author docs: [MODDING.md](MODDING.md). What's 
 | Path | What |
 |---|---|
 | `manifest.json` | Content scripts in the MAIN world at `document_start`, all frames. The `js` list is the load order: `lib/wasmpatch.js`, `loader.js`, then the mods. |
-| `lib/wasmpatch.js` | A small wasm binary editor: finds lifted game functions by their x86 addresses, puts hook instructions at their start (notify, capture, write, skip). A write's target: a fixed address, a pointer, a register, or one the page sets in the slot (`{ page: true }`, the buffer's first word). |
-| `loader.js` | Memory and module capture, the hook system (patching, slots, guard, handles) with the camera as its own write hook, `mem`/`game`/`v3`/`camera` helpers, calibration, mods, options, hotkeys, panel, `scan`. |
-| `mods/` | `topdown.js`, `drone.js`, `rev.js` (Z held at a standstill: car `+0x434` gear held in neutral; writes the gear, an exception to the no-physics rule the user asked for), `camfinder.js` (a research tool), `hookprobe.js` (a tool to check hooks live), `template.js` (an example; not in the manifest). |
-| `tests/` | `node tests/run.mjs` runs everything; `--panel` also renders the panel in headless Chrome (flaky about 1 run in 5, from before 0.3.0: rerun). `fakegame.mjs` builds the game-shaped wasm module the hook tests use. |
+| `lib/wasmpatch.js` | A small wasm binary editor: finds lifted game functions by their x86 addresses, puts hook instructions at their start (notify, capture, write, skip, call). A write's target: a fixed address, a pointer, a register, or one the page sets in the slot (`{ page: true }`, the buffer's first word). A call hook calls another game function (`calls`, resolved through the same tables) with `call_indirect`. |
+| `loader.js` | Memory and module capture, the hook system (patching, slots, guard, handles) with the camera as its own write hook, `mem`/`game`/`v3`/`camera` helpers, calibration, mods, options, hotkeys, the overlay (`OV`, `overlay.layer`, `def.draw`), panel, `scan`. |
+| `mods/` | `topdown.js`, `drone.js`, `rev.js` (Z held at a standstill: car `+0x434` gear held in neutral; writes the gear, an exception to the no-physics rule the user asked for), `map.js` (a road map from the game's road table, a waypoint, an A* route, a corner map; Alt+P the game's own autopilot through call hooks: the AI exception the user asked for), `camfinder.js` (a research tool), `hookprobe.js` (a tool to check hooks live), `template.js` (an example; not in the manifest). |
+| `tests/` | `node tests/run.mjs` runs everything; `--panel` also renders the panel and the overlay (the map, the corner map: `tests/out/*.png`, look at them) in headless Chrome (the panel test is flaky about 1 run in 5, from before 0.3.0: rerun; headless Chrome's virtual time runs animation frames late or not at all, so `overlay.html` drives the map's frame from a timer). `fakegame.mjs` builds the game-shaped wasm module the hook tests use. |
 
 The nfsu2-web source used as the reference sits next to this folder (`../nfsu2-web`, a clone, not part of this
 repo). Its `runtime/` comments are where every address and offset here comes from.
@@ -85,8 +85,40 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
   and `Atomics.waitAsync` woke the page 117/s: the page can follow the game's frames. The drone camera through
   the `u2ml.camera` write hook at `0xFF0000` is flicker-free (user confirmed). Not exercised live yet: write hooks
   from a mod, skip, `{ reg }` targets, the guard tripping.
+- **The lens (0.6.0, 2026-11-17).** The camera hook also copies camera `+0xBC` near, `+0xC0` far (floats) and
+  `+0xC4` field of view (u16), from `camera.set`'s `lens`. The game's own lens is kept from the frames the camera
+  holds it (a value that isn't the one last written is the game's), so a zoom never compounds, and it's put back
+  on release where the camera still holds ours. Top-down: `zoom` option, far plane at least 3 x its height; drone:
+  `zoom`. The user checked both cameras' zoom, the top-down from high up, the game's lens coming back and the
+  mirror/reflections: all good. The game's actual near/far numbers weren't recorded (the panel's `eye` line
+  shows them as `clip near-far`).
 
 ## Not yet proven live
+
+- **0.7.0, first live test (2026-11-17): the call hook works; the autopilot crashes the game.** Map opened, a
+  street picked (the waypoint and the route worked: 518 m away, 562 m by road), Alt+P: `AutoPilotOn` ran through
+  the call hook and returned, and the car's driver kind (`[player+4]+0x24`, `0xD11000`) went 1 → 3 (the AI); the
+  race status's car object for the player stayed 1. The car's brain `0xA7B45A0` had goal `+0x6FC` = 0. Soon after:
+  the guard saw a word at `0xFF0010` (the camera write hook's `+0` on flag, written by something else), then the
+  game's thread trapped, `memory access out of bounds` (as nfsu2-web roam_game.c records for brains with no goal at
+  an outrun's end). So AutoPilotOn in free roam leaves the AI with no goal; Alt+P now refuses (research switch
+  `apResearch`). The map itself isn't confirmed beyond that one route (no screenshot yet).
+- **0.7.0, otherwise not run on the site yet:**
+  - **The overlay:** that it shows over the game and in fullscreen, clicks on an interactive layer don't reach the
+    game, the cost per frame.
+  - **Call hooks:** proven once (AutoPilotOn, above). Not seen: a call with stack arguments (`SetInputMode`). What could go wrong: `call_indirect` with
+    the type index found by structure (any `void(i32)` type), the callee reading something of the CPU struct
+    past the 9 registers (flags, x87) that 0x4022C0's caller left, a callee that needs more than 256 bytes of
+    the stack's free space.
+  - **The map:** whether the road table `0x88A334` and the joints `[0x883DB0]` read as walls.c says on the live
+    site (the panel's `map` line: road points), whether the drawn roads match the city, the route.
+  - **Autopilot:** `Player::AutoPilotOn` `0x5FAE20` on `[0xD00000]` (career.c) in free roam; then `AutoPilotOff`
+    `0x5FAF10` and `SetInputMode(2)` `0x605C70`. **Not known at all: where the AI drives in free roam.** The mod
+    logs `map: autopilot {...}` every 2 s (distance to the waypoint, km/h, driver kind `veh+0x24`, the car's brain
+    `car+0x2C` and goal `brain+0x6FC`, the game's GPS) and a summary line at the end. Next step in
+    `mods/TODO.md`.
+  - **GPS probe:** a capture of `0x529480` (the game's "GPS to here") logs its `ecx`, return address, 4 args and
+    a dump of `[arg 0]` when the player starts the game's GPS from its own World Map.
 
 - **Game events, the last fixes:** no `pause` before the world's clock first moves (one fired as a world loaded
   in), `photoMode` before `pause`. The race entry kept once found and laps against the last known didn't help:
@@ -121,7 +153,9 @@ repo). Its `runtime/` comments are where every address and offset here comes fro
 
 - **Chrome only.** No Firefox build planned.
 - **Mods work everywhere**, races against other players included. No auto-off in network races. Still keep mods
-  away from physics, AI, traffic, network data and saves (MODDING.md says why).
+  away from physics, AI, traffic, network data and saves (MODDING.md says why). The user's exceptions: free rev
+  (gear and rpm at a standstill) and the map's **autopilot** (2026-11-17: the game's own AI drives the player's
+  car to a waypoint in free roam; kept to free roam, off in races and outruns, the keys take it back).
 - **An extension, not a userscript:** the site's CSP (`script-src 'self' 'wasm-unsafe-eval'`, `worker-src 'self'`,
   no inline styles) blocks injected `<script>` tags, blob workers and inline styles. MAIN-world content scripts
   aren't affected, recompiling patched wasm is allowed, and styles set through the CSSOM work.

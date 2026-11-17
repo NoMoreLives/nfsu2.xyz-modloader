@@ -1,0 +1,58 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>overlay</title>
+<!-- The overlay and the map mod on a page with no game: opened by tests/overlay.mjs in headless Chrome (?view=map:
+     the big map open; ?view=mini: the corner map while driving). A made-up city's roads in a fake game memory. -->
+<script>localStorage.clear(); localStorage.setItem('u2ml:panel', 'false');</script>
+<script src="../lib/wasmpatch.js"></script>
+<script src="../loader.js"></script>
+<script src="../mods/map.js"></script>
+</head><body style="background:#2b3a2f;margin:0;height:100vh">
+<script>
+  window.onerror = m => { document.title = 'ERR ' + m; };
+  const view = new URLSearchParams(location.search).get('view') || 'map';
+  // the game's memory as the page makes it (shared needs cross-origin isolation, else a plain one does for drawing)
+  let mem;
+  try { mem = new WebAssembly.Memory({ initial: 4096, maximum: 4096, shared: true }); } catch { mem = null; }
+  const M = U2ML.mem;
+  if (!M.ready) document.title = 'ERR no shared memory (crossOriginIsolated ' + self.crossOriginIsolated + ')';
+  // free roam, the player and its car
+  const PL = 0x1000000, CAR = 0x1002000, RS = 0x1007000;
+  M.setU32(0x8654a4, 6); M.setU32(0xd00000, PL); M.setU32(PL + 4, CAR); M.setU32(0x890118, RS); M.setU32(RS, 4);
+  M.setU32(0x89e7a0, 4000); M.setU8(0x83aa1a, 1);
+  // a made-up city: a 9 x 9 grid of streets 250 m apart with a bend or two, a ring road, joints at the crossings
+  const ROADS = 0x88a334, RD = 0x1100000, JT = 0x1400000;
+  let ri = 0, jn = 0;
+  const roadAt = [];
+  function road(points) {
+    const r = RD + ri * 0x2000;
+    M.setU32(ROADS + 4 * ri, r); M.setU16(r + 0xa, ri); M.setU16(r + 0x34, points.length);
+    points.forEach(([x, y], k) => { const nd = r + 0x8c + 0x38 * k; M.setF32(nd, x); M.setF32(nd + 4, y); M.setU16(nd + 0x12, 0); });
+    roadAt.push(points); return ri++;
+  }
+  function joint(ra, na, rb, nb) { const e = JT + 0x20 * jn++; M.setU16(e + 4, na); M.setU16(e + 6, nb); M.setU16(e + 8, ra); M.setU16(e + 0xa, rb); }
+  const N = 9, G = 250, wob = (i, j) => Math.sin(i * 1.7 + j * 0.9) * 18;
+  const rows = [], cols = [];
+  for (let j = 0; j < N; j++) rows.push(road(Array.from({ length: N }, (_, i) => [i * G - 1000, j * G - 1000 + wob(i, j)])));
+  for (let i = 0; i < N; i++) if (i !== 4) cols.push([i, road(Array.from({ length: N }, (_, j) => [i * G - 1000, j * G - 1000 + wob(i, j)]))]);
+  for (const [i, c] of cols) for (let j = 0; j < N; j++) joint(rows[j], i, c, j);
+  const ring = road(Array.from({ length: 40 }, (_, k) => { const a = k / 39 * Math.PI * 2; return [Math.cos(a) * 1500, Math.sin(a) * 1500]; }));
+  joint(ring, 0, rows[4], 8);     // the ring meets the middle street's east end at (1000, 0)? not quite: a short link road
+  const link = road([[1000, wob(8, 4)], [1250, 0], [1500, 0]]); joint(rows[4], 8, link, 0); joint(link, 2, ring, 0);
+  M.setU32(0x883db0, JT); M.setU32(0x883db4, jn);
+  // the car on the south-west street, heading east; the waypoint in the north-east
+  M.setVec3(CAR + 0x60, [-760, -1000 + wob(1, 0), 0]); M.setVec3(CAR + 0x70, [20, 0, 0]);
+  U2ML.options('map', 'miniSize', 110);
+  U2ML.mods.get('map').store.set('waypoint', [750, 750 + wob(7, 7), 0]);
+  let frames = 0;
+  const check = () => {
+    // the mod's frame from here too: headless Chrome's virtual time runs animation frames late, or not at all
+    const m = U2ML.mods.get('map'); m.def.frame(m.def._t.api, 0.05, m.store);
+    const S = m.def._t.S, L = U2ML.overlay.layers();
+    if (view === 'map' && S.net && !L.find(l => l.name === 'map')?.shown) { U2ML.mods.get('map').def.keys['Alt+KeyN'](U2ML, U2ML.mods.get('map').store, { toggle() {}, on: true }); }
+    if ((!S.route || frames < 10) && ++frames < 700) { setTimeout(check, 50); return; }
+    const shown = L.find(l => l.name === 'map')?.shown;
+    if (!document.title.startsWith('ERR')) document.title = S.route && (view !== 'map' || shown) ? `OK ${view}: ${S.net.n} points, route ${S.route.length} points, ${Math.round(S.left)} m` : `WRONG route ${!!S.route} shown ${shown}`;
+  };
+  setTimeout(check, 50);
+</script>
+</body></html>

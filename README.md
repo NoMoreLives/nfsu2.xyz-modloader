@@ -11,6 +11,7 @@ It comes with:
 | **Top-down camera** | Looks straight down at your car from above. |
 | **Drone camera** | Flies behind and above your car, swings round in turns, tilts into corners. |
 | **Free rev** | Hold Z while stopped and press the accelerator: the engine revs and the car stays put. |
+| **Map & autopilot** | A map of the city's roads: click to set a waypoint and see the route there. The autopilot (the game's AI driving you there) is switched off for now: it crashed the game. |
 | **Camera finder (tool)** | A research tool: finds values in memory that change with the camera view. Not needed to play. |
 | **Hook probe (tool)** | A test tool: shows that the loader's hooks work (how often the game's main loop and view setup run). Not needed to play. |
 
@@ -63,6 +64,8 @@ After that, the camera mods work.
 | **Alt+Shift+M** | Show or hide the panel |
 | **Alt+T** | Top-down camera on or off |
 | **Alt+D** | Drone camera on or off |
+| **Alt+N** | The map on or off |
+| **Alt+P** | Autopilot (switched off for now: it says why) |
 
 On a Mac, **Alt** is the **Option** key. Only one camera mod is on at a time: turning one on turns the other off.
 The camera mods only take over while you drive. In menus, photo mode and replays you see the game's own camera.
@@ -95,6 +98,25 @@ Redline setting under ⚙ is used if the car's can't be read).
 While the mod is on, Z doesn't reach the site in the world (its Z is "Invite to a race"): switch the mod off in the
 panel to invite with Z. Typing in chat isn't affected. Not during a race's countdown, where the game lets you rev
 anyway.
+
+**Map & autopilot**
+
+| On the map (Alt+N) | Does |
+|---|---|
+| Click a road | Sets the waypoint there (it's kept for next time) |
+| Right-click | Clears the waypoint |
+| Drag / mouse wheel | Moves / zooms the map |
+| C | Centres the map on your car |
+| Esc or Alt+N | Closes the map |
+
+The map is drawn from the roads the game's traffic drives on, so it has no buildings or names, only streets. The
+orange line is the shortest way there by road. While a waypoint is set, a small map in the bottom-right corner
+turns with your car and shows the route and how far it is. The game keeps running while the map is open, and your
+driving keys still work.
+
+**Alt+P, the autopilot, is switched off for now.** It hands your car to the game's own AI driver, and in the first
+test the game crashed a moment later: in free roam the game's AI has nothing to drive towards, and it fails
+without one. Alt+P only says so until that's solved.
 
 ### Settings
 
@@ -155,6 +177,7 @@ Object.keys(localStorage).filter(k => k.startsWith('u2ml:')).forEach(k => localS
   is ready. Without this, the
   game and the mod would fight over the camera every frame and the picture would flicker. If anything about this
   doesn't check out, the loader leaves the game unchanged.
+- **Draws over the game.** Mods can draw their own HUD and screens (the map) on a layer over the game.
 - **Learns, then remembers.** It works out the camera's layout and the car's heading by watching the game, and
   saves them.
 

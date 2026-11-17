@@ -1,7 +1,8 @@
 # Roadmap
 
 What could turn the loader into a fuller mod platform, in the order planned. Phases 1 (0.3.0) and 2 (0.4.0) are built
-and proven on the live site; phase 3 (0.5.0) is built and works live, except laps (a to-do below); nothing after it is built yet. To-dos for the mods themselves (not the loader)
+and proven on the live site; phase 3 (0.5.0) is built and works live, except laps (a to-do below); phase 4 (0.6.0) is built and proven live; phase 5 (0.7.0) is built and tested offline only, with call hooks
+(below) and the map & autopilot mod that uses both. To-dos for the mods themselves (not the loader)
 are in [mods/TODO.md](mods/TODO.md).
 Background on how the existing hook works: [CLAUDE.md](CLAUDE.md).
 
@@ -62,13 +63,26 @@ Notify and capture hooks on functions nfsu2-web names: the race settings `0x4FE9
 swapping the camera mover. Mods would use `api.on('raceStart', fn)`. Flow changes such as loading can be polled
 each frame, no hook needed.
 
-## 4. More camera control (cheap)
+## 4. More camera control (cheap): built in 0.6.0, proven live
+
+As built: `camera.set`'s `lens` ([MODDING.md](MODDING.md)), zoom options on both cameras, the top-down's far plane
+at least 3 times its height. Checked live: zoom on both cameras, the top-down from high up, the game's lens back
+after release, the mirror and road reflections right. What was planned:
 
 Add the field of view (`+0xC4`, u16 binary angle) and near/far clip (`+0xBC`/`+0xC0`) to the hook's ranges: a
 zoom for the top-down camera, and no distant scenery cut off from high up. Check the mirror (view 3) and road
 reflection (view 4) look right with a mod camera.
 
-## 5. Overlay API (page side)
+## 5. Overlay API (page side): built in 0.7.0, not tested live yet
+
+As built: [MODDING.md](MODDING.md#drawing-over-the-game-the-overlay). One fixed element over the window (below the
+panel) holding canvases: the HUD layer, cleared each screen frame and drawn by each mod's `def.draw`, and a mod's
+own layers (`api.overlay.layer`), shown and hidden by the mod, optionally taking the mouse and some keys. Sized to
+the window times `devicePixelRatio`, drawn in CSS pixels, moved into the fullscreen element as the panel is. Its
+first user is [mods/map.js](mods/map.js): a full map screen and a corner map. Rendered offline in headless Chrome
+(`tests/overlay.mjs`, pictures in `tests/out/`). To check live: that it shows over the game, in fullscreen too
+(if the site fullscreens the `<canvas>` itself, nothing can show over it: the loader warns), that clicks on the
+map don't reach the game, and what it costs per frame. What was planned:
 
 A layer over the game for mods that draw their own HUD: speedometers, telemetry, a minimap. It must work in
 fullscreen; the panel already handles moving into the fullscreen element.
@@ -91,6 +105,14 @@ shown: colour grading, CRT, sharpening, letterboxing. Look at how the site prese
 
 ## Loader infrastructure
 
+- **Call hooks: built in 0.7.0, worked live once** (AutoPilotOn, 2026-11-17; the autopilot itself then crashed the game: the AI had no goal, mods/TODO.md). A hook kind `call` (`lib/wasmpatch.js`): at the hooked
+  function (the per-frame `0x4022C0` from GameLoop), the game's thread calls another game function when the page
+  asks, as nfsu2-web's `guest_call_ex` (`runtime/guest.h`) does: registers kept, a stack 256 bytes down, the
+  arguments, `ecx` and the return address pushed, `call_indirect` through the function table (the index from
+  `g_fn_ptr`), `eax` kept, registers put back. On only while a request is out. Tested against the fake game
+  (`tests/hook-call.test.mjs`). The first live use is the map mod's autopilot; it also unblocks step 2 of the
+  crash cam ([mods/TODO.md](mods/TODO.md)).
+
 - **To do: `lap` and `finish` are unreliable** (parked 2026-11-16, phase 3). They find the player's racer entry
   through the player at `[0xD00000]`, which reads 0 at times: for ~18 s stretches in a career race, and the
   whole of one Quick Race (`pl` 0, `car` 0, one entry). Ideas: the race parameters' player index (`0x89E7A0 +
@@ -106,4 +128,6 @@ shown: colour grading, CRT, sharpening, letterboxing. Look at how the site prese
 ## Left out on purpose
 
 Hooks on physics, AI, traffic or network data, and editing saves: in online play those change the game for
-other players, which is cheating and risks a ban.
+other players, which is cheating and risks a ban. Two exceptions the user asked for: free rev's gear and rpm
+(at a standstill), and the map mod's autopilot (the game's AI driving your own car, free roam only, never in a
+race or an outrun, and the keys take it back).

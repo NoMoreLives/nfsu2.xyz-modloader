@@ -40,6 +40,7 @@
       { key: 'bank', label: 'Corner tilt', type: 'bool', default: true },
       { key: 'bankAmount', label: 'Tilt amount', type: 'number', min: 0, max: 0.05, step: 0.001, default: 0.012, help: 'radians per m/s² of sideways acceleration' },
       { key: 'bankMax', label: 'Most tilt', type: 'number', min: 0, max: 30, step: 0.5, default: 11.5, unit: '°' },
+      { key: 'zoom', label: 'Zoom', type: 'number', min: 0.5, max: 3, step: 0.05, default: 1, unit: 'x', help: 'times the game\'s own field of view' },
       { key: 'hover', label: 'Hover wobble', type: 'number', min: 0, max: 0.5, step: 0.01, default: 0.05, unit: 'm' },
     ],
     keys: {
@@ -108,7 +109,7 @@
       S.roll += (rollWant - S.roll) * ease(dt, 0.3);
       const up = v3.add(v3.scale([0, 0, 1], Math.cos(S.roll)), v3.scale(right, Math.sin(S.roll)));
 
-      camera.set(eye, look, up);
+      camera.set(eye, look, up, { zoom: o.zoom });
     },
   });
 })();

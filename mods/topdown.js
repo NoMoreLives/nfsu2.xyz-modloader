@@ -13,6 +13,7 @@ U2ML.register({
     { key: 'height', label: 'Height', type: 'number', min: 5, max: 400, step: 1, default: 40, unit: 'm' },
     { key: 'northUp', label: 'Picture turns', type: 'choice', default: false, choices: [{ value: false, label: 'with the car' }, { value: true, label: 'north up' }] },
     { key: 'glide', label: 'Height glide', type: 'number', min: 0.5, max: 20, step: 0.5, default: 6, help: 'how fast a new height is reached' },
+    { key: 'zoom', label: 'Zoom', type: 'number', min: 0.5, max: 4, step: 0.05, default: 1, unit: 'x', help: 'times the game\'s own field of view (more: narrower, flatter from higher up)' },
     { key: 'ahead', label: 'Look ahead', type: 'number', min: 0, max: 1.5, step: 0.05, default: 0, unit: 's', help: 'centre the picture where the car will be this far ahead' },
   ],
   keys: {
@@ -41,7 +42,8 @@ U2ML.register({
     const vel = game.carVel() || [0, 0, 0], ahead = store.get('ahead');
     const centre = [car[0] + vel[0] * ahead, car[1] + vel[1] * ahead, car[2]];
     const up = store.get('northUp') ? [0, 1, 0] : this.heading;
-    camera.set([centre[0], centre[1], centre[2] + this.h], centre, up);
+    // the far plane at least 3 times the height: the ground and what stands on it aren't cut off from high up
+    camera.set([centre[0], centre[1], centre[2] + this.h], centre, up, { zoom: store.get('zoom'), minFar: this.h * 3 });
   },
   disable() { this.h = null; },
 });

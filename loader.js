@@ -7,12 +7,14 @@
 //   2. Puts the mods' hooks (and its own camera hook) into the game's module as the page compiles it.
 //   3. Runs registered mods once per animation frame, gives them memory and game helpers, hooks, hotkeys and a panel.
 //
+//   4. Gives mods an overlay: layers over the game to draw their own HUD and screens on (U2ML.overlay).
+//
 // Console: U2ML (U2ML.status(), U2ML.hooks(), U2ML.mem.u32(0x8654a4), U2ML.scan.f32(1.5) ...). Panel: Alt+Shift+M.
 (() => {
   'use strict';
   if (window.U2ML) return;
 
-  const VERSION = '0.5.0';
+  const VERSION = '0.7.0';
   const log = (...a) => console.log('[u2ml]', ...a);
   const warn = (...a) => console.warn('[u2ml]', ...a);
   const MIN_GAME_PAGES = 4096;        // 256 MB: the game's memory is about 1 GB from its first menus (memory.ts)
@@ -65,7 +67,7 @@
     // +0 the order counter every hook stamps (lib/wasmpatch.js stamp), +4..+15 zero; the slots follow
     list: [], next: 0x00ff0010, compiled: false, busy: null, nextScan: 0,
   };
-  const KINDS = ['notify', 'capture', 'write', 'skip'];
+  const KINDS = ['notify', 'capture', 'write', 'skip', 'call'];
   const REGS = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi', 'eip'];
   const WAITING = 'waiting for the game module';
   function hookProblem(d) {
@@ -83,6 +85,11 @@
       if (!Array.isArray(d.ranges) || !d.ranges.length || !d.ranges.every(r => Array.isArray(r) && Number.isInteger(r[0]) && r[0] >= 0 &&
         Number.isInteger(r[1]) && r[1] > 0 && r[0] + r[1] <= 0x10000)) return 'ranges must be [[offset, bytes], ...]';
     }
+    if (d.kind === 'call') {
+      if (!Number.isInteger(d.fn) || d.fn < 0x400000 || d.fn >= 0x900000) return 'fn must be the x86 address of the game function to call';
+      const args = d.args ?? 0;
+      if (!Number.isInteger(args) || args < 0 || args > 8) return 'args must be 0 to 8';
+    }
     if (d.ret != null && !(Number.isInteger(d.ret) && d.ret >= 0x400000 && d.ret < 0x900000)) return 'ret must be a return address in the game\'s code';
     const pop = d.pop ?? 0;
     if (d.kind === 'skip' && !(Number.isInteger(pop) && pop >= 0 && pop <= 0xffff)) return "pop must be 0 to 65535 (the bytes the function's ret pops)";
@@ -93,7 +100,7 @@
     const bad = hookProblem(d);
     const h = {
       id: `${mod ? mod.def.id : 'u2ml'}.${d && d.name}`, mod, name: d && d.name, kind: d && d.kind, at: d && d.at,
-      keep: d?.keep ?? 1, args: d?.args ?? 0, to: d?.to, ranges: d?.ranges, pop: d?.pop ?? 0, wakes: d?.wake ?? d?.kind === 'notify',
+      keep: d?.keep ?? 1, args: d?.args ?? 0, to: d?.to, ranges: d?.ranges, pop: d?.pop ?? 0, wakes: d?.wake ?? d?.kind === 'notify', fn: d?.fn,
       eax: (d?.eax ?? 0) >>> 0, ret: d?.ret ?? null, slot: 0, funcIdx: null,
       state: bad ? `failed: ${bad}` : !PATCH.want ? 'off: hooks switched off (u2ml:patch)' : HOOKS.compiled ? 'too late: reload the page' : WAITING,
       written: 0, w8: 0,           // what the page last wrote to +0 and +8 (the guard checks nothing else did)
@@ -122,7 +129,7 @@
       // on one function, the skips go last: the other hooks there still see the call
       const go = todo.filter(h => h.slot).sort((x, y) => (x.kind === 'skip') - (y.kind === 'skip'));
       if (!go.length) throw new Error('no hooks to put in');
-      const r = P.patchGame(bytes, { anchor: HOOKS.ANCHOR, hooks: go.map(h => ({ guestAddr: h.at, build: P.prologue[h.kind](h) })) });
+      const r = P.patchGame(bytes, { anchor: HOOKS.ANCHOR, hooks: go.map(h => ({ guestAddr: h.at, calls: h.kind === 'call' ? h.fn : undefined, build: P.prologue[h.kind](h) })) });
       if (!r.results.some(x => x.ok)) throw new Error(`no hook could go in: ${r.results[0].error}`);
       const m = await realCompile.call(WebAssembly, r.bytes);
       go.forEach((h, i) => {
@@ -241,7 +248,8 @@
   const aget = a => { const v = ints(); return v ? Atomics.load(v, a >> 2) >>> 0 : 0; };
   const aset = (a, x) => { const v = ints(); if (v) Atomics.store(v, a >> 2, x | 0); };
   const hookReady = h => h.state === 'in' && !HOOKS.busy && !!memory;
-  const hookWanted = h => h.kind === 'write' ? h.writing && (!h.mod || h.mod.on) : h.user && (!h.mod || h.mod.on);
+  // a call hook is on only while one of its requests is out: the mod asked for that call (even as it goes off)
+  const hookWanted = h => h.kind === 'write' ? h.writing && (!h.mod || h.mod.on) : h.kind === 'call' ? h.user && h.inflight > 0 : h.user && (!h.mod || h.mod.on);
   /** bring the hook's slot in line with what the page wants: +8 first, then the on flag */
   function syncHook(h) {
     if (!hookReady(h)) return;
@@ -351,13 +359,54 @@
       });
     }
     if (h.kind === 'skip') H.result = eax => { h.eax = eax >>> 0; syncHook(h); };
+    if (h.kind === 'call') {
+      const L = () => W().callLayout(h.args);
+      let queue = Promise.resolve(), pending = 0;
+      /** one request: ecx and the arguments in, the request number up; resolves with eax, or null when the hook
+       *  isn't usable or the game didn't make the call within timeout ms (then the request is taken back) */
+      const once = async (ecx, args, timeout) => {
+        if (!hookReady(h) || !h.user) return null;
+        h.inflight = (h.inflight || 0) + 1;
+        try { return await run(ecx, args, timeout); } finally { h.inflight--; syncHook(h); }
+      };
+      const run = async (ecx, args, timeout) => {
+        const S = h.slot, Lo = L();
+        mem.setU32(S + Lo.ecx, ecx >>> 0);
+        for (let i = 0; i < h.args; i++) mem.setU32(S + Lo.args + 4 * i, (args[i] ?? 0) >>> 0);
+        const req = (aget(S + Lo.started) + 1) >>> 0;
+        aset(S + 8, req); h.w8 = req; syncHook(h);
+        const t0 = performance.now();
+        while (aget(S + Lo.finished) !== req) {
+          if (!hookReady(h) || performance.now() - t0 > timeout) {
+            if (hookReady(h) && aget(S + Lo.started) !== req) { const s0 = aget(S + Lo.started); aset(S + 8, s0); h.w8 = s0; }   // taken back
+            return aget(S + Lo.finished) === req ? aget(S + Lo.eax) : null;
+          }
+          await new Promise(r => setTimeout(r, 4));
+        }
+        return aget(S + Lo.eax);
+      };
+      Object.assign(H, {
+        /** ask the game's thread to call the function: call(ecx, [args], { timeout }) -> Promise of eax (unsigned),
+         *  or null. Requests run one after another, one per call of the hooked function. The hook is on only while
+         *  a request is out, so it works while the mod is being switched off too (its disable can still call). */
+        call(ecx = 0, args = [], { timeout = 3000 } = {}) {
+          pending++;
+          const p = queue.then(() => once(ecx, args, timeout));
+          queue = p.catch(() => null).finally(() => { pending--; });
+          return p;
+        },
+        /** requests not finished yet */
+        get pending() { return pending; },
+      });
+    }
     return H;
   }
   // the loader's own hook: the camera, copied in as the frame's main view is made (see cam.set)
   const camHook = declareHook(null, { name: 'camera', kind: 'write', at: 0x005c7ec0, to: { ptr: 0x00832e50 + 0x40 },
-    // the camera's matrix, eye, forward and target; and its velocity (+0x1E0, m/s), which the rain moves its drops
-    // and lens drops by (nfsu2-web runtime/framerate.c F6)
-    ranges: [[0x00, 0x70], [0x1e0, 12]] }).handle;
+    // the camera's matrix, eye, forward and target; its velocity (+0x1E0, m/s), which the rain moves its drops and
+    // lens drops by (nfsu2-web runtime/framerate.c F6); its near and far planes (+0xBC, +0xC0, floats) and field of
+    // view (+0xC4, a u16 binary angle) (overrides.c: CameraParams; photo mode puts its own field of view in there too)
+    ranges: [[0x00, 0x70], [0x1e0, 12], [0xbc, 8], [0xc4, 2]] }).handle;
 
   // ---- game helpers (addresses from nfsu2-web runtime/game.h, look.c, photo.c, splitscreen_mem.h) ----------
   const ADDR = {
@@ -373,7 +422,7 @@
     PL_CAR: 0x4, PL_MOVER: 0x238, MV_TYPE: 0xc,          // player: car, camera mover (type 1 drive cameras, 2 debug/photo)
     CAR_POS: 0x60,                                        // car: its centre, world
     VIEW_CAM: 0x40,
-    CAM_MATRIX: 0x00, CAM_EYE: 0x40, CAM_FWD: 0x50, CAM_TARGET: 0x60, CAM_FOV: 0xc4, CAM_VEL: 0x1e0,   // camera (fov: u16 binary angle)
+    CAM_MATRIX: 0x00, CAM_EYE: 0x40, CAM_FWD: 0x50, CAM_TARGET: 0x60, CAM_NEAR: 0xbc, CAM_FAR: 0xc0, CAM_FOV: 0xc4, CAM_VEL: 0x1e0,   // camera (fov: u16 binary angle)
   };
   const raceCarKept = { rs: 0, track: null, owner: 0 };    // the race's car for the player, once found (game.race)
   const game = {
@@ -492,11 +541,14 @@
       if (cam.wrote && eye.every((x, i) => Math.fround(x) === Math.fround(cam.wrote[i]))) return null;
       return { eye, target: mem.vec3(c + OFF.CAM_TARGET), fwd: mem.vec3(c + OFF.CAM_FWD), matrix: mem.f32s(c + OFF.CAM_MATRIX, 16) };
     },
-    /** put the camera at eye, looking at target, with up as the picture's up (needs the layout) */
-    set(eye, target, up = [0, 0, 1]) {
+    /** put the camera at eye, looking at target, with up as the picture's up (needs the layout).
+     *  lens (optional): { fov: degrees, or zoom: times the game's (2: half the angle), near: m, far: m,
+     *  minFar: m (the game's far, or this if that's nearer) }; what it leaves out stays the game's */
+    set(eye, target, up = [0, 0, 1], lens = {}) {
       const c = game.camera();
       if (!c || !cam.layout) return false;
       const M = buildMatrix(cam.layout, eye, target, up), fwd = v3.norm(v3.sub(target, eye));
+      const L = cam.lensFor(c, lens);
       if (camHook.ready) {
         // through the hook: the game thread copies it in as it makes the frame's view (no flicker)
         camHook.setF32s(OFF.CAM_MATRIX, M);
@@ -510,6 +562,9 @@
         if (!cam.vel.every(Number.isFinite) || v3.len(cam.vel) > 200) cam.vel = [0, 0, 0];
         cam.lastEye = { eye: eye.slice(), t: now, vel: cam.vel };
         camHook.setVec3(OFF.CAM_VEL, cam.vel);
+        camHook.setF32(OFF.CAM_NEAR, L.near); camHook.setF32(OFF.CAM_FAR, L.far);
+        camHook.setBytes(OFF.CAM_FOV, [L.fov & 0xff, L.fov >> 8]);
+        cam.lensWrote = L;
         camHook.commit();
         cam.viaHook = true;
       } else {
@@ -517,6 +572,7 @@
         mem.setVec3(c + OFF.CAM_EYE, eye);
         mem.setVec3(c + OFF.CAM_FWD, fwd);
         mem.setVec3(c + OFF.CAM_TARGET, target);
+        if (L.changed) { mem.setF32(c + OFF.CAM_NEAR, L.near); mem.setF32(c + OFF.CAM_FAR, L.far); mem.setU16(c + OFF.CAM_FOV, L.fov); cam.lensWrote = L; }
       }
       // The game's motion blur off while a mod's camera shows, as photo mode does (nfsu2-web runtime/photo.c
       // G_MOTION_BLUR): the game still moves its own camera each frame before the hook puts ours in, and blurs
@@ -527,6 +583,32 @@
       cam.pending = { c, M, eye, target, t: performance.now() };
       return true;
     },
+    /** the game's own near, far and field of view (kept from the frames the camera holds the game's, not ours),
+     *  and what lens makes of them: { near, far, fov (u16), changed } */
+    lensFor(c, lens = {}) {
+      const W = cam.lensWrote, now = { near: mem.f32(c + OFF.CAM_NEAR), far: mem.f32(c + OFF.CAM_FAR), fov: mem.u16(c + OFF.CAM_FOV) };
+      const G = cam.lensGame || (cam.lensGame = { ...now });
+      for (const k of ['near', 'far', 'fov']) if (!W || now[k] !== (k === 'fov' ? W[k] : Math.fround(W[k]))) G[k] = now[k];
+      const L = { near: G.near, far: G.far, fov: G.fov };
+      const deg = Number.isFinite(lens.fov) ? lens.fov
+        : Number.isFinite(lens.zoom) && lens.zoom > 0 ? 2 * Math.atan(Math.tan(G.fov * Math.PI / 65536) / lens.zoom) * 180 / Math.PI : null;
+      if (deg != null) L.fov = Math.round(Math.min(170, Math.max(1, deg)) * 65536 / 360) & 0xffff;
+      if (Number.isFinite(lens.near) && lens.near > 0) L.near = lens.near;
+      if (Number.isFinite(lens.far) && lens.far > L.near) L.far = lens.far;
+      if (Number.isFinite(lens.minFar) && lens.minFar > L.far) L.far = lens.minFar;
+      L.changed = L.fov !== G.fov || L.near !== G.near || L.far !== G.far;
+      return L;
+    },
+    /** the game's own lens back in the camera, where it still holds ours (the game may not write it every frame) */
+    restoreLens() {
+      const c = game.camera(), W = cam.lensWrote, G = cam.lensGame;
+      cam.lensWrote = null;
+      if (!c || !W || !G) return;
+      if (mem.u16(c + OFF.CAM_FOV) === W.fov) mem.setU16(c + OFF.CAM_FOV, G.fov);
+      if (mem.f32(c + OFF.CAM_NEAR) === Math.fround(W.near)) mem.setF32(c + OFF.CAM_NEAR, G.near);
+      if (mem.f32(c + OFF.CAM_FAR) === Math.fround(W.far)) mem.setF32(c + OFF.CAM_FAR, G.far);
+    },
+    lensWrote: null, lensGame: null,
     recalibrate() { cam.layout = null; cam.calibration = { samples: 0, hits: 0, last: null }; save(LAYOUT_KEY, null); log('camera calibration reset: drive for a second with the game\'s own camera'); },
     // experimental: rewrite the last camera as often as the page lets us, to win more of the race with the game
     // thread (it rewrites the camera every frame). Costs a CPU core. U2ML.camera.pump = true
@@ -601,7 +683,7 @@
 
   // ---- mods ------------------------------------------------------------------------------------------------
   const mods = new Map();
-  const api = { VERSION, mem, game, v3, camera: cam, log, warn,
+  const api = { VERSION, mem, game, v3, camera: cam, log, warn, get overlay() { return overlay; },
     /** a is later than b on the hooks' shared order (allows for the counter wrapping round) */
     after: (a, b) => ((a - b) | 0) > 0 };
   // ---- mod options -----------------------------------------------------------------------------------------
@@ -673,6 +755,7 @@
     if (on && m.def.group) for (const o of mods.values()) if (o !== m && o.on && o.def.group === m.def.group) setEnabled(o.def.id, false);
     m.on = !!on;
     for (const h of HOOKS.list) if (h.mod === m) { if (!m.on) h.writing = false; syncHook(h); }
+    if (!m.on) for (const L of OV.layers.values()) if (L.mod === id) L.api.hide();
     try { (on ? m.def.enable : m.def.disable)?.(api, m.store); } catch (e) { warn(`${id} ${on ? 'enable' : 'disable'}`, e); }
     if (remember) save(`u2ml:on:${id}`, m.on);
     log(`${m.def.name || id} ${m.on ? 'on' : 'off'}`);
@@ -786,6 +869,7 @@
     cam.writer = null;
     cam.wrote = null;
     if (cam.viaHook) { camHook.off(); cam.viaHook = false; cam.lastEye = null; }      // the game's camera back
+    cam.restoreLens();
     if (cam.blurWas != null) {                                                 // and the player's motion blur
       if (mem.u32(ADDR.MOTION_BLUR) === 0) mem.setU32(ADDR.MOTION_BLUR, cam.blurWas);
       cam.blurWas = null;
@@ -801,6 +885,7 @@
       runMods('screen', dt, { on: 'screen' });
       try { axesTick(); } catch (e) { warn('car axes', e); }
     }
+    try { overlayTick(t, dt); } catch (e) { warn('overlay', e); }
     panel.update(t);
     requestAnimationFrame(tick);
   }
@@ -822,6 +907,127 @@
   }
   gameLoop();
 
+
+  // ---- the overlay: layers over the game for the mods' own drawing ---------------------------------------------
+  // One element over the whole window (fixed, above the game, below the panel), holding canvases:
+  //  - the HUD layer, which the loader clears every screen frame and hands to each mod's def.draw (while it's on);
+  //  - a mod's own layers (overlay.layer): shown and hidden by the mod, drawn by their draw callback each screen
+  //    frame while shown, optionally taking the mouse (interactive) and some keys (keys).
+  // Every canvas is sized to the window in CSS pixels times devicePixelRatio, and begin() sets the transform so a
+  // mod draws in CSS pixels. Fullscreen: the overlay moves into the fullscreen element, as the panel does (a
+  // canvas can't hold it: when the game's canvas itself is fullscreen, nothing can show over it; a warning says so).
+  const OV = { root: null, layers: new Map(), hud: null, warnedCanvas: false, z: 2147483640 };
+  const ovHost = () => { const f = document.fullscreenElement; return f && !(f instanceof HTMLCanvasElement) ? f : document.body; };
+  function ovMake() {
+    if (OV.root) return true;
+    if (!document.body || typeof document.createElement !== 'function') return false;
+    if (window !== window.top && innerWidth < 400) return false;      // small frames (ads, embeds) get none
+    const el = document.createElement('div');
+    el.style.cssText = `position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:${OV.z};overflow:hidden;`;
+    OV.root = el;
+    ovHost().append(el);
+    for (const L of OV.layers.values()) L._attach();
+    return true;
+  }
+  /** a layer: overlay.layer(name, { z, interactive, draw(g, layer, info), keys(e) -> handled, mod }) */
+  function ovLayer(name, o = {}) {
+    if (OV.layers.has(name)) return OV.layers.get(name).api;
+    let canvas = null, ctx = null, shown = !!o.shown, interactive = !!o.interactive, w = 0, h = 0, dpr = 1;
+    const L = {
+      name, z: o.z ?? 0, draw: o.draw || null, keys: o.keys || null, mod: o.mod || null,
+      _attach() {
+        if (canvas || !OV.root) return;
+        canvas = document.createElement('canvas');
+        canvas.style.cssText = `position:absolute;left:0;top:0;width:100%;height:100%;z-index:${L.z};`;
+        ctx = canvas.getContext('2d');
+        // the mouse on an interactive layer stays with it (the page's own listeners below don't see it)
+        for (const t of ['mousedown', 'mouseup', 'click', 'dblclick', 'contextmenu', 'wheel', 'pointerdown', 'pointerup', 'pointermove'])
+          canvas.addEventListener(t, e => { e.stopPropagation(); if (t === 'contextmenu' || t === 'wheel') e.preventDefault(); }, { passive: false });
+        for (const [t, fn] of L.listeners) canvas.addEventListener(t, fn, { passive: false });
+        OV.root.append(canvas);
+        L._style();
+      },
+      _style() { if (canvas) { canvas.style.display = shown ? '' : 'none'; canvas.style.pointerEvents = shown && interactive ? 'auto' : 'none'; } },
+      _size() {
+        if (!canvas) return false;
+        const W2 = Math.max(1, OV.root.clientWidth || innerWidth), H2 = Math.max(1, OV.root.clientHeight || innerHeight), d = devicePixelRatio || 1;
+        if (W2 !== w || H2 !== h || d !== dpr) {
+          w = W2; h = H2; dpr = d;
+          canvas.width = Math.round(w * dpr); canvas.height = Math.round(h * dpr);
+        }
+        return true;
+      },
+      listeners: [],
+    };
+    const api = {
+      get name() { return name; },
+      get canvas() { return canvas; },
+      /** the 2D context (null until the page has a body) */
+      get ctx() { return ctx; },
+      /** its size in CSS pixels */
+      get width() { return w; }, get height() { return h; }, get dpr() { return dpr; },
+      get shown() { return shown; },
+      show(on = true) { shown = !!on; L._style(); return api; },
+      hide() { return api.show(false); },
+      toggle() { return api.show(!shown); },
+      /** take the mouse while shown (true), or let it through to the game (false, the default) */
+      interactive(on = true) { interactive = !!on; L._style(); return api; },
+      /** clear it and draw in CSS pixels from here: returns the context */
+      begin() { if (!ctx || !L._size()) return null; ctx.setTransform(1, 0, 0, 1, 0, 0); ctx.clearRect(0, 0, canvas.width, canvas.height); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); return ctx; },
+      /** a mouse or pointer listener on the layer (it gets the events only while shown and interactive) */
+      on(type, fn) { L.listeners.push([type, fn]); if (canvas) canvas.addEventListener(type, fn, { passive: false }); return api; },
+      /** this layer's draw callback: draw(g, layer, info), each screen frame while shown */
+      set draw(fn) { L.draw = fn; }, get draw() { return L.draw; },
+      /** its key handler while shown: keys(e) returns true for a key it used (the game and hotkeys don't see it) */
+      set keys(fn) { L.keys = fn; }, get keys() { return L.keys; },
+    };
+    L.api = api;
+    OV.layers.set(name, L);
+    L._attach();
+    return api;
+  }
+  /** each screen frame: the HUD layer cleared and drawn by the mods, each shown layer by its own draw */
+  function overlayTick(t, dt) {
+    if (!ovMake()) return;
+    if (!OV.hud) OV.hud = ovLayer('hud', { z: 0, shown: true });
+    const info = { t, dt };
+    const drawers = [...mods.values()].filter(m => m.on && typeof m.def.draw === 'function');
+    if (drawers.length || OV.hudDirty) {
+      const g = OV.hud.begin();
+      OV.hudDirty = drawers.length > 0;
+      if (g) for (const m of drawers) {
+        g.save();
+        try { m.def.draw(api, g, m.store, { ...info, width: OV.hud.width, height: OV.hud.height }); }
+        catch (e) { warn(`${m.def.id} draw failed, turned off`, e); setEnabled(m.def.id, false, false); }
+        g.restore();
+      }
+    }
+    for (const L of OV.layers.values()) {
+      if (L.name === 'hud' || !L.api.shown || !L.draw) continue;
+      if (L.mod && !mods.get(L.mod)?.on) continue;
+      const g = L.api.begin();
+      if (!g) continue;
+      g.save();
+      try { L.draw(g, L.api, { ...info, width: L.api.width, height: L.api.height }); } catch (e) { warn(`overlay layer ${L.name}`, e); L.api.hide(); }
+      g.restore();
+    }
+  }
+  /** the shown layer (highest first) whose key handler used the key, if any */
+  function overlayKey(e) {
+    const ls = [...OV.layers.values()].filter(L => L.api.shown && L.keys && (!L.mod || mods.get(L.mod)?.on)).sort((a, b) => b.z - a.z);
+    for (const L of ls) { try { if (L.keys(e)) return true; } catch (err) { warn(`overlay layer ${L.name} keys`, err); } }
+    return false;
+  }
+  const overlay = {
+    layer: ovLayer,
+    /** the HUD layer (the one def.draw draws on) */
+    get hud() { return OV.hud; },
+    /** made (false until the page has a body, and in small frames) */
+    get ready() { return !!OV.root; },
+    /** the layers by name, for the console */
+    layers: () => [...OV.layers.values()].map(L => ({ name: L.name, shown: L.api.shown, z: L.z, mod: L.mod, size: `${L.api.width}x${L.api.height}` })),
+  };
+
   // ---- hotkeys ---------------------------------------------------------------------------------------------
   const combo = e => (e.ctrlKey ? 'Ctrl+' : '') + (e.altKey ? 'Alt+' : '') + (e.shiftKey ? 'Shift+' : '') + e.code;
   const swallowed = new Set();
@@ -838,6 +1044,7 @@
   for (const t of ['keydown', 'keyup', 'keypress']) window.addEventListener(t, e => { if (onPanel(e)) e.stopImmediatePropagation(); }, true);
   window.addEventListener('keydown', e => {
     if (onPanel(e)) return;
+    if (combo(e) !== 'Alt+Shift+KeyM' && overlayKey(e)) { e.preventDefault(); e.stopImmediatePropagation(); swallowed.add(e.code); return; }
     const f = keyAction(combo(e));
     if (!f) return;
     e.preventDefault(); e.stopImmediatePropagation(); swallowed.add(e.code);
@@ -986,13 +1193,18 @@
       lines.push(`module  ${module ? `names ${hasNames ? 'kept' : 'stripped'}` : '-'}`);
       lines.push(`hooks   ${hooksLine()}`);
       lines.push(`frames  ${framesLine()}`);
+      if (OV.root) {
+        const dr = [...mods.values()].filter(m => m.on && typeof m.def.draw === 'function').map(m => m.def.id);
+        const sh = [...OV.layers.values()].filter(L => L.name !== 'hud' && L.api.shown).map(L => L.name);
+        lines.push(`overlay ${dr.length ? `hud: ${dr.join(' ')}` : 'hud idle'}${sh.length ? `  shown: ${sh.join(' ')}` : ''}`);
+      }
       const le = EV.log.at(-1);
       lines.push(`event   ${le ? `${le.name}${le.name === 'lap' ? ` ${le.lap}/${le.laps}` : le.name === 'finish' ? ` ${le.position}/${le.racers}` : ''}, ${((performance.now() - le.t) / 1000).toFixed(0)} s ago` : '-'}`);
       if (memory) {
         const p = game.carPos(), c = game.camera();
         lines.push(`flow ${game.flow()}  race ${game.raceState()}  mover ${game.moverType()}  driving ${game.driving() ? 'yes' : 'no'}`);
         lines.push(`car     ${p ? p.map(f).join(' ') : '-'}`);
-        lines.push(`eye     ${c ? mem.vec3(c + OFF.CAM_EYE).map(f).join(' ') : '-'}  fov ${f(game.fovDeg())}`);
+        lines.push(`eye     ${c ? mem.vec3(c + OFF.CAM_EYE).map(f).join(' ') : '-'}  fov ${f(game.fovDeg())}  clip ${c ? `${f(mem.f32(c + OFF.CAM_NEAR))}-${f(mem.f32(c + OFF.CAM_FAR))}` : '-'}`);
         const C = cam.calibration;
         lines.push(`camera  ${cam.layout ? 'layout known' : game.driving() ? `learning (${C.hits}/${CAL_NEED}, err ${C.last ? C.last.err.toExponential(1) : '-'})` : 'learning: start driving'}`);
         lines.push(`car fwd ${axes.found ? (game.carForward() || []).map(x => x.toFixed(2)).join(' ') || 'lost' : 'learning: drive straight, 20+ km/h'}`);
@@ -1002,9 +1214,10 @@
     },
   };
   document.addEventListener('fullscreenchange', () => {
-    if (!panel.el) return;
     const host = document.fullscreenElement;
-    (host && !(host instanceof HTMLCanvasElement) ? host : document.body).append(panel.el);
+    if (host instanceof HTMLCanvasElement && !OV.warnedCanvas) { OV.warnedCanvas = true; warn('the game\'s canvas itself is fullscreen: the panel and overlays can\'t show over it'); }
+    if (OV.root) ovHost().append(OV.root);
+    if (panel.el) (host && !(host instanceof HTMLCanvasElement) ? host : document.body).append(panel.el);
   });
 
   // ---- memory scanning, for finding values by trial and error ----------------------------------------------
@@ -1038,7 +1251,7 @@
   };
 
   window.U2ML = Object.freeze({
-    VERSION, register, setEnabled, mods, mem, game, v3, camera: cam, scan,
+    VERSION, register, setEnabled, mods, mem, game, v3, camera: cam, scan, overlay,
     /** a mod's option values, or set one: U2ML.options('drone'), U2ML.options('drone', 'dist', 15) */
     options: (id, key, value) => { const m = mods.get(id); if (!m) return null; if (key !== undefined) return m.store.set(key, value); return m.store.all(); },
     status: () => ({ memory: !!memory, module: !!module, hasNames, hooks: hooksLine(), frames: framesLine(), flow: game.flow(), driving: game.driving(), layout: cam.layout }),

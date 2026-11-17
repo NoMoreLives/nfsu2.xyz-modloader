@@ -1,7 +1,7 @@
 // Runs every tests/*.test.mjs with Node (20 or newer) and says which passed.
 //   node tests/run.mjs            all of them
 //   node tests/run.mjs drone      only those whose name has "drone"
-//   node tests/run.mjs --panel    also render the panel in headless Chrome (tests/panel.mjs)
+//   node tests/run.mjs --panel    also render the panel and the overlay in headless Chrome (tests/panel.mjs, overlay.mjs)
 //
 // The tests run the real loader and mods against a fake game: a shared WebAssembly memory with a player, a car
 // and a camera at the game's addresses. They can't prove anything about the live site (see CLAUDE.md).
@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 const here = fileURLToPath(new URL('.', import.meta.url));
 const args = process.argv.slice(2), filter = args.find(a => !a.startsWith('--'));
 const files = readdirSync(here).filter(f => f.endsWith('.test.mjs') && (!filter || f.includes(filter))).sort();
-if (args.includes('--panel')) files.push('panel.mjs');
+if (args.includes('--panel')) files.push('panel.mjs', 'overlay.mjs');
 
 let failed = 0;
 for (const f of files) {

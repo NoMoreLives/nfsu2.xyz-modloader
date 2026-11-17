@@ -1,0 +1,44 @@
+// The camera's lens through the camera hook: a zoom is of the game's own field of view (not of the one the hook
+// put in last frame), minFar only ever raises the far plane, and the game's lens comes back when the mod stops.
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import { buildGame, PAGES, R } from './fakegame.mjs';
+const ROOT = fileURLToPath(new URL('..', import.meta.url)).replace(/\/$/, '');
+let raf = null;
+globalThis.window = globalThis; globalThis.addEventListener = () => {}; globalThis.top = globalThis;
+globalThis.location = { pathname: '/' }; globalThis.document = { addEventListener() {}, body: null };
+const ls = new Map(); globalThis.localStorage = { getItem: k => ls.has(k) ? ls.get(k) : null, setItem: (k, v) => ls.set(k, v), removeItem: k => ls.delete(k) };
+globalThis.requestAnimationFrame = f => { raf = f; }; globalThis.HTMLCanvasElement = class {};
+const quiet = console.log; console.log = (...a) => { if (a[0] !== '[u2ml]') quiet(...a); };
+for (const f of ['lib/wasmpatch.js', 'loader.js']) new Function(fs.readFileSync(`${ROOT}/${f}`, 'utf8'))();
+let ok = true; const check = (w, c) => { console.log(c ? 'ok  ' : 'FAIL', w); ok &&= !!c; };
+let lens = null;
+U2ML.register({ id: 'cam', group: 'camera', defaultOn: true, frame(api) { if (lens) api.camera.set([0, 0, 50], [0, 0.01, 0], [0, 1, 0], lens); } });
+const memory = new WebAssembly.Memory({ initial: PAGES, maximum: PAGES, shared: true });
+const module = await WebAssembly.compileStreaming(new Response(buildGame(U2WasmPatch), { headers: { 'Content-Type': 'application/wasm' } }));
+const { exports: X } = await WebAssembly.instantiate(module, { env: { memory, log() {} } });
+const M = U2ML.mem, CPU = 0x2000000, STACK = 0x3000000, CAM = 0x1003000;
+M.setU32(CPU + R.esp, STACK); M.setU32(0x832e50 + 0x40, CAM);
+U2ML.camera.layout = { kind: 'view', perm: [0, 1, 2], sign: [1, 1, 1], transpose: false };
+const deg = d => Math.round(d * 65536 / 360);
+const gameLens = () => { M.setF32(CAM + 0xbc, 0.5); M.setF32(CAM + 0xc0, 600); M.setU16(CAM + 0xc4, deg(71.5)); M.setU16(CAM + 0xc6, 0xbeef); };
+let t = 0;
+// a game frame: the game's camera mover puts its lens in (or not), the page runs, the view setup copies ours in
+const frame = (gameWrites = true) => { if (gameWrites) gameLens(); raf(t += 1000 / 60); X.fView(CPU); };
+const fov = () => M.u16(CAM + 0xc4) * 360 / 65536;
+frame(); frame();
+check('no mod camera: the game\'s lens stays', Math.abs(fov() - 71.5) < 0.01 && M.f32(CAM + 0xc0) === 600);
+lens = { zoom: 2, minFar: 150 };
+for (let i = 0; i < 5; i++) frame();
+const want = 2 * Math.atan(Math.tan(71.5 / 2 * Math.PI / 180) / 2) * 180 / Math.PI;
+check(`zoom 2: the game's 71.5° made ${want.toFixed(1)}°, the same every frame (${fov().toFixed(2)})`, Math.abs(fov() - want) < 0.01);
+check('minFar under the game\'s far: the game\'s stays; the near too', M.f32(CAM + 0xc0) === 600 && M.f32(CAM + 0xbc) === 0.5);
+check('the word after the field of view is not touched', M.u16(CAM + 0xc6) === 0xbeef);
+for (let i = 0; i < 5; i++) frame(false);
+check('the game doesn\'t write its lens again: still a zoom of 71.5°, not of our own', Math.abs(fov() - want) < 0.01);
+lens = { fov: 30, minFar: 2000, near: 1 };
+frame(false);
+check('fov in degrees, minFar raising the far plane, a near plane', Math.abs(fov() - 30) < 0.01 && M.f32(CAM + 0xc0) === 2000 && M.f32(CAM + 0xbc) === 1);
+lens = null; frame(false); frame(false);
+check('the mod stops, the game doesn\'t write its lens: the game\'s lens back', Math.abs(fov() - 71.5) < 0.01 && M.f32(CAM + 0xc0) === 600 && M.f32(CAM + 0xbc) === 0.5);
+console.log(ok ? 'ALL OK' : 'SOME FAILED'); process.exit(ok ? 0 : 1);
